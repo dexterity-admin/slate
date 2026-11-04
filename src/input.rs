@@ -127,6 +127,9 @@ impl App {
     }
 
     fn editor_key(&mut self, vk: u32, ctrl: bool, shift: bool, alt: bool) -> bool {
+        if self.cur_ref().loading.is_some() {
+            return false;
+        }
         let vis = self.vis_rows(self.av);
         let column = alt && shift && !ctrl;
         let mv = match vk {
@@ -253,6 +256,9 @@ impl App {
                 self.redraw();
                 return;
             }
+        }
+        if self.cur_ref().loading.is_some() {
+            return;
         }
         self.record(Action::Char(ch));
         let mut s = [0u8; 4];

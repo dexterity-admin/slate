@@ -252,6 +252,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = DestroyWindow(hwnd);
             }
             T_BACKUP => a.write_backups(),
+            app::T_LOAD => a.redraw(),
             updater_ui::T_UPDATE => a.on_update_timer(),
             updater_ui::T_HANDSHAKE => a.on_handshake_timer(),
             updater_ui::T_CLEANUP => a.on_cleanup_timer(),
@@ -296,6 +297,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.on_update_msg(*m, wp.0 != 0);
         }
         updater_ui::WM_UPDATE_OK => a.on_update_ok(),
+        app::WM_LOADED => {
+            let l = Box::from_raw(lp.0 as *mut app::Loaded);
+            a.on_loaded(*l);
+        }
         WM_TEST_KEY => {
             a.on_key(wp.0 as u32, lp.0 & 1 != 0, lp.0 & 2 != 0, lp.0 & 4 != 0);
         }

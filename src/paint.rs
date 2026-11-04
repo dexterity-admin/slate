@@ -167,6 +167,27 @@ impl App {
 
     fn paint_view(&mut self, v: usize) {
         self.paint_tabs(v);
+        if let Some((done, total)) = &self.buf_of(v).loading {
+            let (vx, _, vw, _) = self.view_rect(v);
+            let (_, ty, _, th) = self.text_rect(v);
+            let done = done.load(std::sync::atomic::Ordering::Relaxed);
+            let frac = if *total == 0 { 0.0 } else { (done as f32 / *total as f32).min(1.0) };
+            let g = &self.gfx;
+            let w = (vw - 80.0).min(420.0);
+            let x = vx + (vw - w) / 2.0;
+            let y = ty + th * 0.38;
+            let name = self.buf_of(v).name();
+            let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+            let label = if frac >= 1.0 {
+                format!("Indexing {name}…")
+            } else {
+                format!("Loading {name}   {:.0} of {:.0} MB", mb(done), mb(*total))
+            };
+            g.text(&label, g.ui.as_ref().unwrap(), x, y - 30.0, w, 24.0, C::Dim);
+            g.fill_round(x, y, w, 6.0, 3.0, C::SelDim);
+            g.fill_round(x, y, (w * frac).max(6.0), 6.0, 3.0, C::Accent);
+            return;
+        }
         let (vx, _, vw, _) = self.view_rect(v);
         let (tx, ty, tw, th) = self.text_rect(v);
         let rows = self.rows(v);

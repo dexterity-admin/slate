@@ -59,11 +59,28 @@ fn initial_gap(len: usize) -> usize {
 /// Reads a file into a buffer that already has room for the editing gap,
 /// so loading a large file never reallocates (and briefly doubles) it.
 pub fn read_for_doc(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    read_for_doc_progress(path, None)
+}
+
+/// As `read_for_doc`, publishing the bytes read so far to `progress`.
+pub fn read_for_doc_progress(path: &std::path::Path, progress: Option<&std::sync::atomic::AtomicU64>) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
     let mut v = Vec::with_capacity(len + initial_gap(len) + 16);
-    f.read_to_end(&mut v)?;
+    let Some(progress) = progress else {
+        f.read_to_end(&mut v)?;
+        return Ok(v);
+    };
+    let mut chunk = vec![0u8; 4 << 20];
+    loop {
+        let n = f.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        v.extend_from_slice(&chunk[..n]);
+        progress.store(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(v)
 }
 

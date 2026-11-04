@@ -80,6 +80,9 @@ pub struct Buffer {
     pub tab_size: usize,
     /// Fixed tab title for special buffers (search results).
     pub label: Option<String>,
+    /// Background load in progress: (bytes read so far, total bytes).
+    /// The buffer is an empty placeholder and must not be edited or saved.
+    pub loading: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
 }
 
 pub fn display_name(path: &Option<PathBuf>, untitled: usize) -> String {
@@ -116,6 +119,7 @@ impl Buffer {
             backed_up_gen: 0,
             tab_size: 4,
             label: None,
+            loading: None,
         }
     }
 

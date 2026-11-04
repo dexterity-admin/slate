@@ -26,6 +26,16 @@ pub const WM_FIF_DONE: u32 = WM_APP + 1;
 pub const T_BENCH: usize = 1;
 pub const T_BACKUP: usize = 3;
 pub const T_STATUS: usize = 4;
+pub const T_LOAD: usize = 8;
+pub const WM_LOADED: u32 = WM_APP + 5;
+/// Files at least this large load on a worker thread.
+const ASYNC_LOAD: u64 = 16 << 20;
+
+/// Result of a background load, posted back to the window.
+pub struct Loaded {
+    pub id: u32,
+    pub result: Result<(crate::doc::Doc, Enc, Eol, bool), String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cmd {
@@ -541,6 +551,10 @@ impl App {
             self.after_switch();
             return true;
         }
+        let size = std::fs::metadata(&pb).map(|m| m.len()).unwrap_or(0);
+        if size >= ASYNC_LOAD {
+            return self.open_async(pb, size);
+        }
         let raw = match crate::doc::read_for_doc(&pb) {
             Ok(r) => r,
             Err(e) => {
@@ -572,6 +586,85 @@ impl App {
         }
         self.after_switch();
         true
+    }
+
+    /// Opens a large file on a worker thread; its tab shows progress until
+    /// the text arrives in `on_loaded`.
+    fn open_async(&mut self, pb: PathBuf, size: u64) -> bool {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        let replace = self.pristine_active();
+        let id = self.new_buffer(Vec::new());
+        let progress = Arc::new(AtomicU64::new(0));
+        {
+            let b = self.bufs.last_mut().unwrap();
+            b.path = Some(pb.clone());
+            b.lang = syntax::lang_for_path(&pb.to_string_lossy());
+            b.loading = Some((progress.clone(), size));
+        }
+        self.add_tab(self.av, id);
+        if let Some(old) = replace {
+            self.views[self.av].tabs.retain(|t| t.buf != old);
+            self.views[self.av].active = self.views[self.av].tabs.iter().position(|t| t.buf == id).unwrap_or(0);
+            self.bufs.retain(|b| b.id != old);
+        }
+        settings::push_recent(&pb.to_string_lossy());
+        let hwnd = self.hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let result = crate::doc::read_for_doc_progress(&pb, Some(&progress)).map_err(|e| e.to_string()).map(|raw| {
+                let d = enc::decode(raw, None);
+                (crate::doc::Doc::load(d.text), d.enc, d.eol, d.mixed_eol)
+            });
+            let p = Box::into_raw(Box::new(Loaded { id, result }));
+            unsafe {
+                if PostMessageW(HWND(hwnd as *mut _), WM_LOADED, WPARAM(0), LPARAM(p as isize)).is_err() {
+                    drop(Box::from_raw(p));
+                }
+            }
+        });
+        unsafe {
+            SetTimer(self.hwnd, T_LOAD, 120, None);
+        }
+        self.after_switch();
+        true
+    }
+
+    pub fn on_loaded(&mut self, l: Loaded) {
+        // The tab may have been closed while loading.
+        if let Some(i) = self.bufs.iter().position(|b| b.id == l.id && b.loading.is_some()) {
+            match l.result {
+                Ok((doc, enc, eol, mixed)) => {
+                    let b = &mut self.bufs[i];
+                    b.doc = doc;
+                    b.enc = enc;
+                    b.eol = eol;
+                    b.mixed_eol = mixed;
+                    b.loading = None;
+                    b.states.clear();
+                    b.gen += 1;
+                    b.sels = vec![Sel::default()];
+                    b.mtime = b.path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+                    let name = b.name();
+                    if mixed {
+                        self.flash(&format!("{name}: mixed line endings unified to {} (applies on save)", eol.name()));
+                    }
+                }
+                Err(e) => {
+                    let name = self.bufs[i].name();
+                    self.bufs[i].loading = None;
+                    if let Some((v, t)) = self.find_open_id(l.id) {
+                        self.close_tab(v, t);
+                    }
+                    self.flash(&format!("Cannot open {name}: {e}"));
+                }
+            }
+        }
+        if !self.bufs.iter().any(|b| b.loading.is_some()) {
+            unsafe {
+                let _ = KillTimer(self.hwnd, T_LOAD);
+            }
+        }
+        self.after_switch();
     }
 
     pub fn open_dialog(&mut self) {
@@ -1371,6 +1464,21 @@ impl App {
     pub fn exec(&mut self, c: Cmd) {
         let hwnd = self.hwnd;
         let mut changed = true;
+        // A tab that is still loading holds an empty placeholder: nothing
+        // may edit or save it.
+        let safe_while_loading = matches!(
+            c,
+            Cmd::New | Cmd::Open | Cmd::Close | Cmd::CloseAll | Cmd::CloseOthers | Cmd::ReopenClosed | Cmd::Recent
+                | Cmd::SwitchFile | Cmd::Reveal | Cmd::CopyPath | Cmd::Exit | Cmd::Palette | Cmd::ZoomIn | Cmd::ZoomOut
+                | Cmd::ZoomReset | Cmd::Wrap | Cmd::Whitespace | Cmd::Theme | Cmd::MoveOther | Cmd::CloneOther
+                | Cmd::FocusOther | Cmd::CloseSplit | Cmd::NextTab | Cmd::PrevTab | Cmd::ToggleSession | Cmd::About
+                | Cmd::CheckUpdates | Cmd::InstallUpdate | Cmd::AutoUpdate | Cmd::SaveAll | Cmd::FindInFiles
+                | Cmd::MacroRecord | Cmd::UseTabs | Cmd::TabSize
+        );
+        if !self.bufs.is_empty() && self.cur_ref().loading.is_some() && !safe_while_loading {
+            self.flash("Still loading this file…");
+            return;
+        }
         match c {
             Cmd::New => self.new_file(),
             Cmd::Open => self.open_dialog(),
@@ -1383,7 +1491,7 @@ impl App {
                 self.save_buf(id, true);
             }
             Cmd::SaveAll => {
-                let ids: Vec<u32> = self.bufs.iter().filter(|b| b.dirty() && Some(b.id) != self.results_buf).map(|b| b.id).collect();
+                let ids: Vec<u32> = self.bufs.iter().filter(|b| b.dirty() && b.loading.is_none() && Some(b.id) != self.results_buf).map(|b| b.id).collect();
                 for id in ids {
                     if let Some((v, i)) = self.find_open_id(id) {
                         self.views[v].active = i;
