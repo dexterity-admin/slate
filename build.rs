@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed=res/slate.rc");
     println!("cargo:rerun-if-changed=res/slate.ico");
     println!("cargo:rerun-if-changed=res/slate.manifest");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     let Some(rc) = find_rc() else {
         println!("cargo:warning=rc.exe not found; building without icon and manifest");
         return;
@@ -29,6 +30,11 @@ fn main() {
     });
     let mut cmd = Command::new(&rc);
     cmd.arg("/nologo");
+    let ver = std::env::var("CARGO_PKG_VERSION").unwrap();
+    for (name, var) in [("VER_MAJOR", "CARGO_PKG_VERSION_MAJOR"), ("VER_MINOR", "CARGO_PKG_VERSION_MINOR"), ("VER_PATCH", "CARGO_PKG_VERSION_PATCH")] {
+        cmd.arg(format!("/D{name}={}", std::env::var(var).unwrap()));
+    }
+    cmd.arg(format!("/DVER_STR=\"{ver}\""));
     if let Some(inc) = include {
         for sub in ["um", "shared"] {
             cmd.arg(format!("/I{}", inc.join(sub).display()));
