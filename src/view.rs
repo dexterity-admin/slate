@@ -161,7 +161,17 @@ impl App {
             }
         }
         let mut line = self.tab(v).top;
-        let mut y = ty - self.tab(v).sub as f32 * lh;
+        let mut y = ty - self.tab(v).sub as f32 * lh + self.scroll_offset(v);
+        // While a smooth scroll settles, lines above the top come into view.
+        while y > ty {
+            match self.bufs[bi].prev_visible(line) {
+                Some(p) => {
+                    line = p;
+                    y -= self.line_rows(bi, p, wrap) as f32 * lh;
+                }
+                None => break,
+            }
+        }
         let mut out = Vec::new();
         while y < ty + th {
             let key = self.layout(bi, line, wrap);
@@ -201,7 +211,53 @@ impl App {
         (x, y)
     }
 
-    pub fn scroll_by(&mut self, v: usize, delta: isize) {
+    /// Current smooth-scroll pixel offset of view `v`.
+    pub fn scroll_offset(&self, v: usize) -> f32 {
+        self.scroll_anim[v].as_ref().map(|t| t.value()).unwrap_or(0.0)
+    }
+
+    /// Scrolls by `delta` rows and glides there instead of jumping.
+    pub fn scroll_smooth(&mut self, v: usize, delta: isize) {
+        let moved = self.scroll_by(v, delta);
+        if moved != 0 {
+            let start = self.scroll_offset(v) + moved as f32 * self.gfx.line_h;
+            self.scroll_anim[v] = Some(crate::anim::Tween::new(start, 0.0, 160.0));
+        }
+    }
+
+    /// Scrolls by `delta` rows; returns the rows actually moved.
+    pub fn scroll_by(&mut self, v: usize, delta: isize) -> isize {
+        let (t0, s0) = (self.tab(v).top, self.tab(v).sub);
+        self.scroll_by_inner(v, delta);
+        let (t1, s1) = (self.tab(v).top, self.tab(v).sub);
+        if (t0, s0) == (t1, s1) {
+            return 0;
+        }
+        // Count rows between the two positions (lines without wrap).
+        if self.wrap_width(v).is_none() {
+            let bi = self.bi(self.tab(v).buf);
+            let (a, b) = (t0.min(t1), t0.max(t1));
+            let mut n = 0isize;
+            let mut l = a;
+            while l < b {
+                match self.bufs[bi].next_visible(l) {
+                    Some(nx) => l = nx,
+                    None => break,
+                }
+                n += 1;
+            }
+            if t1 > t0 {
+                n
+            } else {
+                -n
+            }
+        } else {
+            // Wrapped rows vary per line; jump without gliding.
+            0
+        }
+    }
+
+    fn scroll_by_inner(&mut self, v: usize, delta: isize) {
         let bi = self.bi(self.tab(v).buf);
         let wrap = self.wrap_width(v);
         let n = self.bufs[bi].doc.line_count();

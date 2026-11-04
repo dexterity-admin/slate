@@ -136,12 +136,12 @@ impl App {
             VK_LEFT => Some(if ctrl { Move::WordLeft } else { Move::Left }),
             VK_RIGHT => Some(if ctrl { Move::WordRight } else { Move::Right }),
             VK_UP if ctrl && !shift => {
-                self.scroll_by(self.av, -1);
+                self.scroll_smooth(self.av, -1);
                 self.redraw();
                 return true;
             }
             VK_DOWN if ctrl && !shift => {
-                self.scroll_by(self.av, 1);
+                self.scroll_smooth(self.av, 1);
                 self.redraw();
                 return true;
             }
@@ -178,7 +178,7 @@ impl App {
                 if matches!(vk, VK_PRIOR | VK_NEXT) {
                     let d = vis.saturating_sub(1).max(1) as isize;
                     let av = self.av;
-                    self.scroll_by(av, if vk == VK_PRIOR { -d } else { d });
+                    self.scroll_smooth(av, if vk == VK_PRIOR { -d } else { d });
                 }
                 let b = self.cur();
                 edit::move_carets(b, m, shift);
@@ -717,7 +717,7 @@ impl App {
             self.scroll_x(v, d as f32 / 120.0 * self.gfx.char_w * 8.0);
         } else {
             let rows = (delta as f32 / 120.0 * 3.0).round() as isize;
-            self.scroll_by(v, -rows);
+            self.scroll_smooth(v, -rows);
         }
         self.redraw();
     }

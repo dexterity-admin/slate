@@ -1,15 +1,20 @@
 //! Direct2D / DirectWrite resources: render target, brushes per theme colour,
 //! text formats and font metrics.
 
+use crate::icons::{self, Icon};
 use crate::sys::wide;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use windows::core::{Interface, Result, PCWSTR};
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{BOOL, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
+    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_SOLID,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_LINE_JOIN_ROUND, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
 };
 use windows::Win32::Graphics::DirectWrite::*;
 
@@ -65,6 +70,25 @@ const LIGHT: [u32; NC] = [
     0x9A6700, 0xCF222E, 0x953800, 0x0550AE, 0x0550AE, 0xFFFFFF,
 ];
 
+/// Accent choices: (name, dark-theme colour, light-theme colour).
+pub const ACCENTS: [(&str, u32, u32); 7] = [
+    ("Slate blue", 0x7AA2F7, 0x2F6FEB),
+    ("Teal", 0x5CCFE6, 0x0B7E8A),
+    ("Violet", 0xB392F0, 0x7C3AED),
+    ("Amber", 0xF5B062, 0xC2610C),
+    ("Green", 0x7FD88F, 0x1F883D),
+    ("Rose", 0xF38BA8, 0xD6336C),
+    ("Graphite", 0xAEB8C8, 0x57606A),
+];
+
+fn blend(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| -> u32 {
+        let (x, y) = (((a >> s) & 255) as f32, ((b >> s) & 255) as f32);
+        ((x * t + y * (1.0 - t)).round() as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
 pub struct Gfx {
     pub d2d: ID2D1Factory,
     pub dw: IDWriteFactory,
@@ -80,12 +104,15 @@ pub struct Gfx {
     pub ui: Option<IDWriteTextFormat>,
     pub ui_bold: Option<IDWriteTextFormat>,
     pub ui_small: Option<IDWriteTextFormat>,
-    pub icons: Option<IDWriteTextFormat>,
-    pub icons_small: Option<IDWriteTextFormat>,
     pub char_w: f32,
     pub line_h: f32,
     pub font_px: f32,
     pub dark: bool,
+    pub accent: usize,
+    stroke: Option<ID2D1StrokeStyle>,
+    geos: RefCell<HashMap<Icon, ID2D1PathGeometry>>,
+    /// Brushes for one-off colours (file badges), keyed by rgb and alpha.
+    tints: RefCell<HashMap<(u32, u8), ID2D1SolidColorBrush>>,
 }
 
 impl Gfx {
@@ -103,12 +130,14 @@ impl Gfx {
                 ui: None,
                 ui_bold: None,
                 ui_small: None,
-                icons: None,
-                icons_small: None,
                 char_w: 8.0,
                 line_h: 18.0,
                 font_px: 14.0,
                 dark: true,
+                accent: 0,
+                stroke: None,
+                geos: RefCell::new(HashMap::new()),
+                tints: RefCell::new(HashMap::new()),
             })
         }
     }
@@ -133,16 +162,43 @@ impl Gfx {
 
     pub fn drop_target(&mut self) {
         self.brushes.clear();
+        self.tints.borrow_mut().clear();
         self.rt = None;
         self.hrt = None;
     }
 
+    /// The theme palette with the chosen accent and the selection colours
+    /// derived from it.
+    fn palette(&self) -> [u32; NC] {
+        let mut pal = if self.dark { DARK } else { LIGHT };
+        let (_, d, l) = ACCENTS[self.accent.min(ACCENTS.len() - 1)];
+        let acc = if self.dark { d } else { l };
+        let bg = pal[C::Bg as usize];
+        pal[C::Accent as usize] = acc;
+        pal[C::Sel as usize] = blend(acc, bg, if self.dark { 0.30 } else { 0.24 });
+        pal[C::SelDim as usize] = blend(acc, bg, if self.dark { 0.16 } else { 0.12 });
+        pal
+    }
+
     pub fn make_brushes(&mut self) -> Result<()> {
         let Some(rt) = &self.rt else { return Ok(()) };
-        let pal = if self.dark { &DARK } else { &LIGHT };
+        let pal = self.palette();
         self.brushes.clear();
+        self.tints.borrow_mut().clear();
         for &c in pal.iter() {
             self.brushes.push(unsafe { rt.CreateSolidColorBrush(&hex(c), None)? });
+        }
+        if self.stroke.is_none() {
+            let props = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                dashCap: D2D1_CAP_STYLE_ROUND,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                miterLimit: 1.0,
+                dashStyle: D2D1_DASH_STYLE_SOLID,
+                dashOffset: 0.0,
+            };
+            self.stroke = unsafe { self.d2d.CreateStrokeStyle(&props, None).ok() };
         }
         Ok(())
     }
@@ -152,7 +208,61 @@ impl Gfx {
     }
 
     pub fn color(&self, c: C) -> D2D1_COLOR_F {
-        hex(if self.dark { DARK[c as usize] } else { LIGHT[c as usize] })
+        hex(self.palette()[c as usize])
+    }
+
+    /// A brush for an arbitrary colour (cached).
+    pub fn tint(&self, rgb: u32, alpha: f32) -> ID2D1SolidColorBrush {
+        let key = (rgb, (alpha * 255.0) as u8);
+        if let Some(b) = self.tints.borrow().get(&key) {
+            return b.clone();
+        }
+        let mut c = hex(rgb);
+        c.a = alpha;
+        let b = unsafe { self.rt().CreateSolidColorBrush(&c, None).unwrap() };
+        self.tints.borrow_mut().insert(key, b.clone());
+        b
+    }
+
+    /// Fills with a theme colour at `alpha` (hover fades).
+    pub fn fill_alpha(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: C, alpha: f32) {
+        if alpha <= 0.01 {
+            return;
+        }
+        let b = self.b(c);
+        unsafe {
+            b.SetOpacity(alpha.min(1.0));
+            let rr = D2D1_ROUNDED_RECT { rect: rect(x, y, w, h), radiusX: r, radiusY: r };
+            self.rt().FillRoundedRectangle(&rr, b);
+            b.SetOpacity(1.0);
+        }
+    }
+
+    /// Draws `icon` centred in the box, `size` DIPs across, `width` DIPs stroke.
+    pub fn draw_icon(&self, icon: Icon, x: f32, y: f32, w: f32, h: f32, c: C, size: f32, width: f32) {
+        self.draw_icon_brush(icon, x, y, w, h, self.b(c), size, width);
+    }
+
+    pub fn draw_icon_brush(&self, icon: Icon, x: f32, y: f32, w: f32, h: f32, brush: &ID2D1SolidColorBrush, size: f32, width: f32) {
+        let geo = {
+            let mut g = self.geos.borrow_mut();
+            if !g.contains_key(&icon) {
+                let Ok(geo) = icons::build(&self.d2d, icon) else { return };
+                g.insert(icon, geo);
+            }
+            g[&icon].clone()
+        };
+        let k = size / 16.0;
+        let ox = x + (w - size) / 2.0;
+        let oy = y + (h - size) / 2.0;
+        unsafe {
+            let rt = self.rt();
+            let mut old = Matrix3x2::default();
+            rt.GetTransform(&mut old);
+            rt.SetTransform(&Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: old.M31 + ox, M32: old.M32 + oy });
+            rt.DrawGeometry(&geo, brush, width / k, self.stroke.as_ref());
+            rt.SetTransform(&old);
+        }
     }
 
     fn family_exists(&self, name: &str) -> bool {
@@ -226,16 +336,10 @@ impl Gfx {
             let ui = self.format("Segoe UI", 12.5, DWRITE_FONT_WEIGHT_NORMAL)?;
             let bold = self.format("Segoe UI", 12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let small = self.format("Segoe UI", 11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let icon_font = if self.family_exists("Segoe Fluent Icons") { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" };
-            let icons = self.format(icon_font, 10.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-            let icons_small = self.format(icon_font, 8.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             unsafe {
-                for f in [&ui, &bold, &small, &icons, &icons_small] {
+                for f in [&ui, &bold, &small] {
                     f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
                     f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                }
-                for f in [&icons, &icons_small] {
-                    f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
                 }
                 let sign = self.dw.CreateEllipsisTrimmingSign(&ui)?;
                 let trim = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
@@ -246,8 +350,6 @@ impl Gfx {
             self.ui = Some(ui);
             self.ui_bold = Some(bold);
             self.ui_small = Some(small);
-            self.icons = Some(icons);
-            self.icons_small = Some(icons_small);
         }
         Ok(())
     }
@@ -281,11 +383,6 @@ impl Gfx {
         unsafe {
             self.rt().DrawText(&v, f, &rect(x, y, w, h), self.b(c), D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
         }
-    }
-
-    pub fn icon(&self, glyph: char, x: f32, y: f32, w: f32, h: f32, c: C, small: bool) {
-        let f = if small { self.icons_small.as_ref() } else { self.icons.as_ref() };
-        self.text(&glyph.to_string(), f.unwrap(), x, y, w, h, c);
     }
 
     pub fn measure(&self, s: &str, f: &IDWriteTextFormat) -> f32 {

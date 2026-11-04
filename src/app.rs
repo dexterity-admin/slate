@@ -1,5 +1,6 @@
 //! Application state: buffers, views/tabs, commands, files and session.
 
+use crate::anim::Tween;
 use crate::buffer::{Buffer, EditKind, Sel};
 use crate::edit;
 use crate::enc::{self, Enc, Eol};
@@ -27,6 +28,7 @@ pub const T_BENCH: usize = 1;
 pub const T_BACKUP: usize = 3;
 pub const T_STATUS: usize = 4;
 pub const T_LOAD: usize = 8;
+pub const T_ANIM: usize = 9;
 pub const WM_LOADED: u32 = WM_APP + 5;
 /// Files at least this large load on a worker thread.
 const ASYNC_LOAD: u64 = 16 << 20;
@@ -47,7 +49,7 @@ pub enum Cmd {
     NextBookmark, PrevBookmark, ClearBookmarks, ToggleFold, FoldAll, UnfoldAll, ZoomIn, ZoomOut,
     ZoomReset, Wrap, Whitespace, Theme, MoveOther, CloneOther, FocusOther, CloseSplit, MacroRecord,
     MacroPlay, Language, Encoding, ReopenEncoding, LineEnding, TabSize, UseTabs, Overtype, NextTab,
-    PrevTab, ToggleSession, About, CheckUpdates, InstallUpdate, AutoUpdate,
+    PrevTab, ToggleSession, About, CheckUpdates, InstallUpdate, AutoUpdate, Accent, Animations,
 }
 
 pub static COMMANDS: &[(Cmd, &str, &str)] = &[
@@ -115,6 +117,8 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::Wrap, "View: Toggle Word Wrap", "Alt+Z"),
     (Cmd::Whitespace, "View: Toggle Whitespace and Line Endings", ""),
     (Cmd::Theme, "View: Toggle Light / Dark Theme", ""),
+    (Cmd::Accent, "View: Accent Colour…", ""),
+    (Cmd::Animations, "View: Toggle Animations", ""),
     (Cmd::MoveOther, "View: Move Tab to Other View", ""),
     (Cmd::CloneOther, "View: Clone Tab to Other View", ""),
     (Cmd::FocusOther, "View: Focus Other View", "F8"),
@@ -230,6 +234,7 @@ pub enum PalAct {
     Reopen(Enc),
     Eol(Eol),
     TabSize(usize),
+    Accent(usize),
 }
 
 pub struct PalItem {
@@ -400,6 +405,13 @@ pub struct App {
     /// `-nosession`: never read or write the session or backups.
     pub no_session: bool,
     pub upd: crate::updater_ui::UpdateState,
+    /// Smooth scroll: pixel offset per view easing back to 0.
+    pub scroll_anim: [Option<Tween>; 2],
+    /// Active-tab underline per view: (x tween, width tween, target x, target w).
+    pub tab_ind: RefCell<[Option<(Tween, Tween, f32, f32)>; 2]>,
+    pub pal_since: Option<Instant>,
+    pub find_since: Option<Instant>,
+    pub anim_timer: bool,
     /// The new version took over; close without saving the session again.
     pub exiting_for_update: bool,
 }
@@ -455,6 +467,11 @@ impl App {
             status_segs: Vec::new(),
             no_session: false,
             upd: Default::default(),
+            scroll_anim: [None, None],
+            tab_ind: RefCell::new([None, None]),
+            pal_since: None,
+            find_since: None,
+            anim_timer: false,
             exiting_for_update: false,
         }
     }
@@ -1114,6 +1131,9 @@ impl App {
             }
         };
         let dir = self.cur_ref().path.as_ref().and_then(|p| p.parent()).map(|p| p.display().to_string()).unwrap_or_default();
+        if self.find.is_none() {
+            self.find_since = Some(Instant::now());
+        }
         let fb = self.find.get_or_insert_with(|| FindBar {
             replace: false,
             fif: false,
@@ -1334,6 +1354,9 @@ impl App {
     // ---- palette ------------------------------------------------------------------------
 
     pub fn open_palette(&mut self, mode: PalMode, title: &str, items: Vec<PalItem>, initial: &str) {
+        if self.palette.is_none() {
+            self.pal_since = Some(Instant::now());
+        }
         let mut p = Palette { mode, title: title.to_string(), input: Input::default(), items, shown: Vec::new(), sel: 0, scroll: 0 };
         p.input.set(initial);
         self.palette = Some(p);
@@ -1425,6 +1448,12 @@ impl App {
                     self.update_title();
                 }
             }
+            PalAct::Accent(i) => {
+                settings::get_mut().accent = i;
+                self.gfx.accent = i;
+                let _ = self.gfx.make_brushes();
+                self.cache.clear();
+            }
             PalAct::TabSize(n) => {
                 settings::get_mut().tab_size = n;
                 for b in self.bufs.iter_mut() {
@@ -1473,7 +1502,7 @@ impl App {
                 | Cmd::ZoomReset | Cmd::Wrap | Cmd::Whitespace | Cmd::Theme | Cmd::MoveOther | Cmd::CloneOther
                 | Cmd::FocusOther | Cmd::CloseSplit | Cmd::NextTab | Cmd::PrevTab | Cmd::ToggleSession | Cmd::About
                 | Cmd::CheckUpdates | Cmd::InstallUpdate | Cmd::AutoUpdate | Cmd::SaveAll | Cmd::FindInFiles
-                | Cmd::MacroRecord | Cmd::UseTabs | Cmd::TabSize
+                | Cmd::MacroRecord | Cmd::UseTabs | Cmd::TabSize | Cmd::Accent | Cmd::Animations
         );
         if !self.bufs.is_empty() && self.cur_ref().loading.is_some() && !safe_while_loading {
             self.flash("Still loading this file…");
@@ -1916,6 +1945,25 @@ impl App {
                     s.restore_session
                 };
                 self.flash(if on { "Session restore on" } else { "Session restore off" });
+                changed = false;
+            }
+            Cmd::Accent => {
+                let cur = settings::get().accent;
+                let items = crate::gfx::ACCENTS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| PalItem { label: a.0.to_string(), hint: if i == cur { "current".into() } else { String::new() }, act: PalAct::Accent(i) })
+                    .collect();
+                self.open_palette(PalMode::List, "Accent colour", items, "");
+                changed = false;
+            }
+            Cmd::Animations => {
+                let on = {
+                    let mut s = settings::get_mut();
+                    s.animate = !s.animate;
+                    s.animate
+                };
+                self.flash(if on { "Animations on" } else { "Animations off" });
                 changed = false;
             }
             Cmd::CheckUpdates => {

@@ -2,6 +2,9 @@
 
 use crate::app::{App, Hit, Input, PalMode, CAP_W, SCROLL_W, STATUS_H, TAB_H, TITLE_H};
 use crate::gfx::{rect, C};
+use crate::icons::Icon;
+
+const PANEL_MS: f32 = 170.0;
 use crate::settings;
 use crate::syntax::LANGS;
 use crate::ui::*;
@@ -43,6 +46,46 @@ impl App {
             }
         }
         self.sync_caret();
+        self.schedule_frame();
+    }
+
+    /// Keeps a ~60 fps timer only while something animates.
+    fn schedule_frame(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+        let moving = self.scroll_anim.iter().flatten().any(|t| !t.done())
+            || self.tab_ind.borrow().iter().flatten().any(|(x, w, ..)| !x.done() || !w.done())
+            || crate::anim::appear(self.pal_since, PANEL_MS) < 1.0 && self.palette.is_some()
+            || crate::anim::appear(self.find_since, PANEL_MS) < 1.0 && self.find.is_some();
+        if !moving {
+            self.scroll_anim = [None, None];
+        }
+        unsafe {
+            if moving && !self.anim_timer {
+                SetTimer(self.hwnd, crate::app::T_ANIM, 15, None);
+                self.anim_timer = true;
+            } else if !moving && self.anim_timer {
+                let _ = KillTimer(self.hwnd, crate::app::T_ANIM);
+                self.anim_timer = false;
+            }
+        }
+    }
+
+    /// Hover highlights are instant: a fade would redraw the whole window at
+    /// 60 fps for every item the mouse crosses.
+    fn hover_alpha(&self) -> f32 {
+        1.0
+    }
+
+    /// The app mark: the pipe "S" on a slate tile, as in the app icon.
+    fn draw_logo(&self, x: f32, y: f32, s: f32) {
+        let g = &self.gfx;
+        let tile = g.tint(0x1C2333, 1.0);
+        unsafe {
+            let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(x, y, s, s), radiusX: s * 0.24, radiusY: s * 0.24 };
+            g.rt().FillRoundedRectangle(&rr, &tile);
+        }
+        g.draw_icon_brush(Icon::Pipe, x, y, s, s, &g.tint(0x2F5FC8, 1.0), s * 0.86, s * 0.2);
+        g.draw_icon_brush(Icon::Pipe, x, y, s, s, &g.tint(0x7FB6FF, 1.0), s * 0.86, s * 0.12);
     }
 
     /// Places the Windows caret at the focused element. Windows blinks it,
@@ -79,46 +122,40 @@ impl App {
 
     fn paint_title(&self) {
         let g = &self.gfx;
-        g.fill(0.0, 0.0, self.w, TITLE_H, C::Chrome);
+        self.gfx.fill(0.0, 0.0, self.w, TITLE_H, C::Chrome);
+        let ha = self.hover_alpha();
         if self.hover == Hit::Menu {
-            g.fill(0.0, 0.0, MENU_W, TITLE_H, C::Hover);
+            g.fill_alpha(4.0, 4.0, MENU_W - 8.0, TITLE_H - 8.0, 6.0, C::Hover, ha);
         }
-        g.icon('\u{E700}', 0.0, 0.0, MENU_W, TITLE_H, C::Fg, false);
-        // Logo: a rounded slate tile.
-        g.fill_round(MENU_W + 2.0, 9.0, 16.0, 16.0, 4.0, C::Accent);
-        g.text("S", g.ui_bold.as_ref().unwrap(), MENU_W + 6.5, 8.0, 12.0, 18.0, C::OnAccent);
+        g.draw_icon(Icon::Menu, 0.0, 0.0, MENU_W, TITLE_H, C::Fg, 16.0, 1.4);
+        self.draw_logo(MENU_W + 1.0, 8.0, 18.0);
         let b = self.cur_ref();
         let name = match &b.path {
             Some(p) => p.display().to_string(),
             None => b.name(),
         };
-        let title = format!("{name}{}", if b.dirty() { "  •" } else { "" });
+        let title = format!("{name}{}", if b.dirty() { "  \u{2022}" } else { "" });
         let tx = MENU_W + 28.0;
         let tw = self.w - tx - 3.0 * CAP_W - 16.0;
         g.text(&title, g.ui.as_ref().unwrap(), tx, 0.0, tw, TITLE_H, C::Dim);
         if self.recording.is_some() {
             let rw = 120.0;
             g.fill_round(self.w - 3.0 * CAP_W - rw - 10.0, 8.0, rw, 18.0, 9.0, C::Danger);
-            g.text("●  Recording macro", g.ui_small.as_ref().unwrap(), self.w - 3.0 * CAP_W - rw, 8.0, rw, 18.0, C::OnAccent);
+            g.text("\u{25CF}  Recording macro", g.ui_small.as_ref().unwrap(), self.w - 3.0 * CAP_W - rw, 8.0, rw, 18.0, C::OnAccent);
         }
         for (h, rc) in self.caption_buttons() {
             let hovered = self.hover == h;
             if hovered {
-                g.fill(rc.x, rc.y, rc.w, rc.h, if h == Hit::Close { C::Danger } else { C::Hover });
+                g.fill_alpha(rc.x, rc.y, rc.w, rc.h, 0.0, if h == Hit::Close { C::Danger } else { C::Hover }, ha);
             }
-            let glyph = match h {
-                Hit::Min => '\u{E921}',
-                Hit::Max => {
-                    if self.maximized {
-                        '\u{E923}'
-                    } else {
-                        '\u{E922}'
-                    }
-                }
-                _ => '\u{E8BB}',
+            let icon = match h {
+                Hit::Min => Icon::Minimize,
+                Hit::Max if self.maximized => Icon::Restore,
+                Hit::Max => Icon::Maximize,
+                _ => Icon::Close,
             };
             let c = if hovered && h == Hit::Close { C::OnAccent } else { C::Fg };
-            g.icon(glyph, rc.x, rc.y, rc.w, rc.h, c, false);
+            g.draw_icon(icon, rc.x, rc.y, rc.w, rc.h, c, 12.0, 1.1);
         }
         g.fill(0.0, TITLE_H - 1.0, self.w, 1.0, C::Border);
     }
@@ -126,42 +163,70 @@ impl App {
     fn paint_tabs(&self, v: usize) {
         let g = &self.gfx;
         let (vx, vy, vw, _) = self.view_rect(v);
-        g.fill(vx, vy, vw, TAB_H, C::Tabs);
+        self.gfx.fill(vx, vy, vw, TAB_H, C::Tabs);
         g.fill(vx, vy + TAB_H - 1.0, vw, 1.0, C::Border);
         let (tabs, plus) = self.tab_layout(v);
         g.clip(vx, vy, vw, TAB_H);
         let focused_view = v == self.av;
+        let ha = self.hover_alpha();
+        let small = g.ui_small.as_ref().unwrap();
         for (i, t) in tabs.iter().enumerate() {
             let tab = &self.views[v].tabs[i];
             let b = &self.bufs[self.bi(tab.buf)];
             let active = i == self.views[v].active;
             let hovered = matches!(self.hover, Hit::Tab(hv, hi) | Hit::TabClose(hv, hi) if hv == v && hi == i);
             if active {
-                g.fill_round(t.x, t.y, t.w, t.h + 6.0, 6.0, C::Bg);
+                g.fill_round(t.x, t.y, t.w, t.h + 6.0, 7.0, C::Bg);
                 g.fill(t.x, t.y + t.h - 1.0, t.w, 1.0, C::Bg);
-                g.fill_round(t.x + 8.0, t.y, t.w - 16.0, 2.0, 1.0, if focused_view { C::Accent } else { C::Faint });
             } else if hovered {
-                g.fill_round(t.x, t.y + 2.0, t.w, t.h - 6.0, 6.0, C::Hover);
+                g.fill_alpha(t.x, t.y + 2.0, t.w, t.h - 6.0, 7.0, C::Hover, ha);
+            }
+            let mut tx = t.x + 10.0;
+            if let Some((label, rgb)) = badge(b) {
+                let bw = self.text_w(&label, true) + 10.0;
+                let by = t.y + (t.h - 17.0) / 2.0;
+                unsafe {
+                    let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(tx, by, bw, 17.0), radiusX: 4.0, radiusY: 4.0 };
+                    g.rt().FillRoundedRectangle(&rr, &g.tint(rgb, if g.dark { 0.22 } else { 0.16 }));
+                    let u: Vec<u16> = label.encode_utf16().collect();
+                    g.rt().DrawText(&u, small, &rect(tx + 5.0, by, bw, 17.0), &g.tint(rgb, 1.0), Default::default(), Default::default());
+                }
+                tx += bw + 7.0;
             }
             let fg = if active { C::Fg } else { C::Dim };
-            let name = b.name();
             let f = if active { g.ui_bold.as_ref() } else { g.ui.as_ref() };
-            g.text(&name, f.unwrap(), t.x + 12.0, t.y, t.w - 40.0, t.h - 1.0, fg);
+            g.text(&b.name(), f.unwrap(), tx, t.y, t.x + t.w - 30.0 - tx, t.h - 1.0, fg);
             let cr = Self::tab_close_rect(t);
             let close_hover = self.hover == Hit::TabClose(v, i);
             if close_hover {
-                g.fill_round(cr.x, cr.y, cr.w, cr.h, 4.0, C::Hover);
+                g.fill_alpha(cr.x, cr.y, cr.w, cr.h, 4.0, C::Hover, 1.0);
             }
             if b.dirty() && !hovered && Some(b.id) != self.results_buf {
                 g.fill_round(cr.x + 6.0, cr.y + 6.0, 8.0, 8.0, 4.0, if active { C::Accent } else { C::Dim });
             } else if active || hovered {
-                g.icon('\u{E8BB}', cr.x, cr.y, cr.w, cr.h, if close_hover { C::Fg } else { C::Dim }, true);
+                g.draw_icon(Icon::Close, cr.x, cr.y, cr.w, cr.h, if close_hover { C::Fg } else { C::Dim }, 10.0, 1.2);
             }
         }
-        if self.hover == Hit::NewTab(v) {
-            g.fill_round(plus.x, plus.y, plus.w, plus.h, 5.0, C::Hover);
+        // The active-tab underline glides between tabs.
+        if let Some(t) = tabs.get(self.views[v].active) {
+            let (tx, tw) = (t.x + 10.0, t.w - 20.0);
+            let mut ind = self.tab_ind.borrow_mut();
+            let slot = &mut ind[v];
+            let restart = match slot {
+                Some((_, _, x, w)) => (*x - tx).abs() > 0.5 || (*w - tw).abs() > 0.5,
+                None => true,
+            };
+            if restart {
+                let (cx, cw) = slot.as_ref().map(|(x, w, ..)| (x.value(), w.value())).unwrap_or((tx, tw));
+                *slot = Some((crate::anim::Tween::new(cx, tx, 220.0), crate::anim::Tween::new(cw, tw, 220.0), tx, tw));
+            }
+            let (x, w, ..) = slot.as_ref().unwrap();
+            g.fill_round(x.value(), t.y, w.value(), 2.5, 1.25, if focused_view { C::Accent } else { C::Faint });
         }
-        g.icon('\u{E710}', plus.x, plus.y, plus.w, plus.h, C::Dim, true);
+        if self.hover == Hit::NewTab(v) {
+            g.fill_alpha(plus.x, plus.y, plus.w, plus.h, 6.0, C::Hover, ha);
+        }
+        g.draw_icon(Icon::Plus, plus.x, plus.y, plus.w, plus.h, C::Dim, 12.0, 1.3);
         g.unclip();
     }
 
@@ -179,7 +244,7 @@ impl App {
             let name = self.buf_of(v).name();
             let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
             let label = if frac >= 1.0 {
-                format!("Indexing {name}…")
+                format!("Indexing {name}\u{2026}")
             } else {
                 format!("Loading {name}   {:.0} of {:.0} MB", mb(done), mb(*total))
             };
@@ -285,14 +350,14 @@ impl App {
                 }
                 if row.line + 1 < b.doc.line_count() {
                     let (ex, ey) = self.end_xy(l);
-                    self.gfx.text("¬", self.gfx.mono.as_ref().unwrap(), ox + ex + 1.0, row.y + ey, 20.0, lh, C::Faint);
+                    self.gfx.text("\u{AC}", self.gfx.mono.as_ref().unwrap(), ox + ex + 1.0, row.y + ey, 20.0, lh, C::Faint);
                 }
             }
             if b.is_folded(row.line) {
                 let (ex, ey) = self.end_xy(l);
                 let fx = ox + ex + 8.0;
                 self.gfx.fill_round(fx, row.y + ey + 2.0, 30.0, lh - 4.0, 4.0, C::SelDim);
-                self.gfx.text("⋯", self.gfx.ui.as_ref().unwrap(), fx + 8.0, row.y + ey, 30.0, lh, C::Dim);
+                self.gfx.text("\u{22EF}", self.gfx.ui.as_ref().unwrap(), fx + 8.0, row.y + ey, 30.0, lh, C::Dim);
             }
         }
         // Carets: the primary one is the system caret, extra ones are drawn.
@@ -337,8 +402,8 @@ impl App {
             g.text(&num, num_fmt, vx + 14.0, row.y, gw - 14.0 - 22.0, lh, fg);
             let folded = b.is_folded(row.line);
             if folded || (gutter_hover && b.fold_end(row.line).is_some()) {
-                let glyph = if folded { '\u{E76C}' } else { '\u{E70D}' };
-                g.icon(glyph, vx + gw - 20.0, row.y, 16.0, lh, if folded { C::Accent } else { C::Dim }, true);
+                let icon = if folded { Icon::ChevronRight } else { Icon::ChevronDown };
+                g.draw_icon(icon, vx + gw - 20.0, row.y, 16.0, lh, if folded { C::Accent } else { C::Dim }, 11.0, 1.3);
             }
         }
         g.unclip();
@@ -410,7 +475,7 @@ impl App {
                 segs.push((format!("Update {}", m.version), 9));
             }
             if self.recording.is_some() {
-                segs.push(("● REC".into(), 8));
+                segs.push(("\u{25CF} REC".into(), 8));
             }
             if self.overtype {
                 segs.push(("OVR".into(), 7));
@@ -429,25 +494,28 @@ impl App {
             segs.push((LANGS[b.lang].name.to_string(), 4));
         }
         let g = &self.gfx;
-        g.fill(0.0, y, self.w, STATUS_H, C::Chrome);
+        self.gfx.fill(0.0, y, self.w, STATUS_H, C::Chrome);
         g.fill(0.0, y, self.w, 1.0, C::Border);
         let small = g.ui_small.as_ref().unwrap();
         let mut x = self.w - 8.0;
         let mut hits = Vec::new();
         for (text, id) in segs.iter().rev() {
-            let w = self.text_w(text, true) + 18.0;
+            // The update button carries an arrow icon before its label.
+            let icon_w = if *id == 9 { 16.0 } else { 0.0 };
+            let w = self.text_w(text, true) + 18.0 + icon_w;
             x -= w;
             if *id == 9 {
                 g.fill_round(x + 3.0, y + 3.0, w - 6.0, STATUS_H - 6.0, 4.0, C::Accent);
+                g.draw_icon(Icon::Update, x + 6.0, y, 14.0, STATUS_H, C::OnAccent, 11.0, 1.4);
             } else if self.hover == Hit::Status(*id as usize) {
-                g.fill(x, y + 1.0, w, STATUS_H - 1.0, C::Hover);
+                g.fill_alpha(x, y + 1.0, w, STATUS_H - 1.0, 0.0, C::Hover, self.hover_alpha());
             }
             let c = match *id {
                 8 => C::Danger,
                 9 => C::OnAccent,
                 _ => C::Dim,
             };
-            g.text(text, small, x + 9.0, y, w, STATUS_H, c);
+            g.text(text, small, x + 9.0 + icon_w, y, w, STATUS_H, c);
             hits.push((x, x + w, *id));
         }
         let left = match &self.status {
@@ -455,7 +523,7 @@ impl App {
             None => {
                 let b = self.cur_ref();
                 let n = b.doc.line_count();
-                format!("{} lines  ·  {} bytes", n, b.doc.len())
+                format!("{} lines  \u{B7}  {} bytes", n, b.doc.len())
             }
         };
         g.text(&left, small, 12.0, y, (x - 24.0).max(0.0), STATUS_H, C::Dim);
@@ -510,7 +578,46 @@ impl App {
         g.stroke_round(rc.x, rc.y, rc.w, rc.h, 8.0, C::Border, 1.0);
     }
 
+    /// Draws `f` fading in and sliding down while the panel's appear
+    /// animation (started at `since`) runs.
+    fn panel_fx(&self, since: Option<std::time::Instant>, f: impl FnOnce(&Self)) {
+        use std::mem::ManuallyDrop;
+        use windows::Foundation::Numerics::Matrix3x2;
+        use windows::Win32::Graphics::Direct2D::{D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS};
+        let t = crate::anim::appear(since, PANEL_MS);
+        if t >= 1.0 {
+            f(self);
+            return;
+        }
+        let rt = self.gfx.rt();
+        unsafe {
+            let Ok(layer) = rt.CreateLayer(None) else {
+                f(self);
+                return;
+            };
+            let ident = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
+            let params = D2D1_LAYER_PARAMETERS {
+                contentBounds: rect(-1e6, -1e6, 2e6, 2e6),
+                geometricMask: ManuallyDrop::new(None),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: ident,
+                opacity: t,
+                opacityBrush: ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            rt.PushLayer(&params, &layer);
+            rt.SetTransform(&Matrix3x2 { M32: (1.0 - t) * -10.0, ..ident });
+            f(self);
+            rt.SetTransform(&ident);
+            rt.PopLayer();
+        }
+    }
+
     fn paint_find(&self) {
+        self.panel_fx(self.find_since, |s| s.paint_find_inner());
+    }
+
+    fn paint_find_inner(&self) {
         let Some((panel, fields, btns)) = self.find_layout() else { return };
         let fb = self.find.as_ref().unwrap();
         let g = &self.gfx;
@@ -549,17 +656,17 @@ impl App {
                 g.fill_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::SelDim);
                 g.stroke_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::Accent, 1.0);
             } else if hovered {
-                g.fill_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::Hover);
+                g.fill_alpha(rc.x, rc.y, rc.w, rc.h, 4.0, C::Hover, self.hover_alpha());
             }
             let fg = if on { C::Accent } else { C::Fg };
             match *id {
                 FB_CASE => g.text("Aa", small, rc.x + 3.0, rc.y, rc.w, rc.h, fg),
                 FB_WORD => g.text("ab", small, rc.x + 4.0, rc.y, rc.w, rc.h, fg),
                 FB_REGEX => g.text(".*", ui, rc.x + 6.0, rc.y, rc.w, rc.h, fg),
-                FB_PREV => g.icon('\u{E70E}', rc.x, rc.y, rc.w, rc.h, C::Fg, true),
-                FB_NEXT => g.icon('\u{E70D}', rc.x, rc.y, rc.w, rc.h, C::Fg, true),
-                FB_CLOSE => g.icon('\u{E8BB}', rc.x, rc.y, rc.w, rc.h, C::Fg, true),
-                FB_MODE => g.icon(if fb.replace { '\u{E70D}' } else { '\u{E76C}' }, rc.x, rc.y, rc.w, rc.h, C::Dim, true),
+                FB_PREV => g.draw_icon(Icon::ChevronUp, rc.x, rc.y, rc.w, rc.h, C::Fg, 12.0, 1.3),
+                FB_NEXT => g.draw_icon(Icon::ChevronDown, rc.x, rc.y, rc.w, rc.h, C::Fg, 12.0, 1.3),
+                FB_CLOSE => g.draw_icon(Icon::Close, rc.x, rc.y, rc.w, rc.h, C::Fg, 10.0, 1.3),
+                FB_MODE => g.draw_icon(if fb.replace { Icon::ChevronDown } else { Icon::ChevronRight }, rc.x, rc.y, rc.w, rc.h, C::Dim, 11.0, 1.3),
                 FB_REPL1 | FB_REPLALL | FB_SEARCH => {
                     if !hovered {
                         g.stroke_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::Border, 1.0);
@@ -578,13 +685,17 @@ impl App {
     }
 
     fn paint_palette(&self) {
+        self.panel_fx(self.pal_since, |s| s.paint_palette_inner());
+    }
+
+    fn paint_palette_inner(&self) {
         let Some((pr, rows)) = self.palette_rect() else { return };
         let p = self.palette.as_ref().unwrap();
         let g = &self.gfx;
         self.panel(&pr);
-        g.icon('\u{E721}', pr.x + 6.0, pr.y + 6.0, 28.0, PAL_INPUT - 12.0, C::Dim, true);
+        g.draw_icon(Icon::Search, pr.x + 6.0, pr.y + 6.0, 28.0, PAL_INPUT - 12.0, C::Dim, 14.0, 1.4);
         let inp = r(pr.x + 34.0, pr.y + 6.0, pr.w - 42.0, PAL_INPUT - 12.0);
-        let ph = if p.title.is_empty() { "Type a command…".to_string() } else { p.title.clone() };
+        let ph = if p.title.is_empty() { "Type a command\u{2026}".to_string() } else { p.title.clone() };
         self.draw_input(&p.input, &inp, true, &ph, 0.0);
         let ui = g.ui.as_ref().unwrap();
         let small = g.ui_small.as_ref().unwrap();
@@ -601,7 +712,7 @@ impl App {
                 g.fill_round(pr.x + 6.0, y, pr.w - 12.0, PAL_ROW, 5.0, C::SelDim);
                 g.fill_round(pr.x + 6.0, y + 7.0, 3.0, PAL_ROW - 14.0, 1.5, C::Accent);
             } else if self.hover == Hit::PalRow(k) {
-                g.fill_round(pr.x + 6.0, y, pr.w - 12.0, PAL_ROW, 5.0, C::Hover);
+                g.fill_alpha(pr.x + 6.0, y, pr.w - 12.0, PAL_ROW, 5.0, C::Hover, self.hover_alpha());
             }
             let hw = if it.hint.is_empty() { 0.0 } else { (g.measure(&it.hint, small) + 8.0).min(pr.w * 0.45) };
             g.text(&it.label, ui, pr.x + 18.0, y, pr.w - 36.0 - hw, PAL_ROW, C::Fg);

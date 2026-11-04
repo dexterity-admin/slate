@@ -21,6 +21,47 @@ pub const FB_REPLALL: usize = 7;
 pub const FB_MODE: usize = 8;
 pub const FB_SEARCH: usize = 9;
 
+/// Short file-type label and colour shown on a tab, from the extension.
+pub fn badge(b: &crate::buffer::Buffer) -> Option<(String, u32)> {
+    if b.label.is_some() {
+        return Some(("FIND".into(), 0x8B95A7));
+    }
+    let path = b.path.as_ref()?;
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    let color = match ext.as_str() {
+        "pcf" | "pcfx" => 0xF0883E,
+        "csv" | "tsv" => 0x3FB950,
+        "xlsx" | "xls" => 0x3FB950,
+        "log" | "out" => 0x8B95A7,
+        "txt" | "md" | "markdown" => 0x6E9BD1,
+        "rs" => 0xDE7A4A,
+        "py" | "pyw" => 0x4B8BBE,
+        "js" | "mjs" | "cjs" | "jsx" => 0xE5C04B,
+        "ts" | "tsx" => 0x3B82C4,
+        "json" | "jsonc" => 0xD9A93B,
+        "xml" | "xaml" | "config" | "csproj" | "nwd" | "nwf" => 0xE0703A,
+        "html" | "htm" => 0xE34C26,
+        "css" | "scss" => 0x5A8FD8,
+        "c" | "h" | "cpp" | "hpp" | "cc" => 0x6A8FCF,
+        "cs" => 0x9B6BDF,
+        "java" | "kt" => 0xC0603A,
+        "go" => 0x3CB4C8,
+        "ps1" | "psm1" => 0x4A9BE0,
+        "bat" | "cmd" | "sh" => 0x7AA06A,
+        "sql" => 0xD25A8C,
+        "ini" | "cfg" | "toml" | "yml" | "yaml" => 0x9AA3B2,
+        _ => 0x8B95A7,
+    };
+    let mut label: String = ext.chars().take(4).collect::<String>().to_uppercase();
+    if label.is_empty() {
+        return None;
+    }
+    if label == "MARKDOWN" {
+        label = "MD".into();
+    }
+    Some((label, color))
+}
+
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -56,8 +97,9 @@ impl App {
             .tabs
             .iter()
             .map(|t| {
-                let name = self.bufs[self.bi(t.buf)].name();
-                (self.text_w(&name, false) + 56.0).clamp(96.0, 240.0)
+                let b = &self.bufs[self.bi(t.buf)];
+                let badge_w = badge(b).map(|(l, _)| self.text_w(&l, true) + 17.0).unwrap_or(0.0);
+                (self.text_w(&b.name(), false) + 56.0 + badge_w).clamp(96.0, 280.0)
             })
             .collect();
         let avail = vw - 8.0 - 36.0;

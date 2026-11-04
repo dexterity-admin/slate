@@ -14,6 +14,9 @@ pub struct Settings {
     pub show_ws: bool,
     pub restore_session: bool,
     pub auto_update: bool,
+    /// Index into gfx::ACCENTS.
+    pub accent: usize,
+    pub animate: bool,
     /// Release the user chose to skip.
     pub skip_version: String,
     pub recent: Vec<String>,
@@ -31,6 +34,8 @@ static S: RwLock<Settings> = RwLock::new(Settings {
     show_ws: false,
     restore_session: true,
     auto_update: true,
+    accent: 0,
+    animate: true,
     skip_version: String::new(),
     recent: Vec::new(),
     win: None,
@@ -80,6 +85,8 @@ pub fn load() {
             "show_ws" => s.show_ws = v == "1",
             "restore_session" => s.restore_session = v != "0",
             "auto_update" => s.auto_update = v != "0",
+            "accent" => s.accent = v.parse().unwrap_or(0usize).min(crate::gfx::ACCENTS.len() - 1),
+            "animate" => s.animate = v != "0",
             "skip_version" => s.skip_version = v.into(),
             "recent" if !v.is_empty() => s.recent.push(v.into()),
             "window" => {
@@ -102,6 +109,7 @@ pub fn save() {
     out += &format!("wrap={}\ntab_size={}\nuse_tabs={}\n", b(s.wrap), s.tab_size, b(s.use_tabs));
     out += &format!("show_ws={}\nrestore_session={}\n", b(s.show_ws), b(s.restore_session));
     out += &format!("auto_update={}\nskip_version={}\n", b(s.auto_update), s.skip_version);
+    out += &format!("accent={}\nanimate={}\n", s.accent, b(s.animate));
     if let Some((x, y, w, h, m)) = s.win {
         out += &format!("window={x},{y},{w},{h},{}\n", m as i32);
     }

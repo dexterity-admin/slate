@@ -1,11 +1,13 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 
+mod anim;
 mod app;
 mod buffer;
 mod doc;
 mod edit;
 mod enc;
 mod gfx;
+mod icons;
 mod input;
 mod paint;
 mod search;
@@ -21,11 +23,9 @@ use app::{App, Hit, T_BACKUP, T_BENCH, T_STATUS, TITLE_H, WM_FIF_DONE};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U;
-use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, ScreenToClient, PAINTSTRUCT};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -117,6 +117,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_GETMINMAXINFO => {
             let mmi = &mut *(lp.0 as *mut MINMAXINFO);
             mmi.ptMinTrackSize = POINT { x: 520, y: 340 };
+            // Maximise to the work area so the taskbar stays visible.
+            use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                // WM_NCCALCSIZE trims this frame back off when maximised.
+                let dpi = GetDpiForWindow(hwnd);
+                let f = GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                let (w, m) = (mi.rcWork, mi.rcMonitor);
+                mmi.ptMaxPosition = POINT { x: w.left - m.left - f, y: w.top - m.top - f };
+                mmi.ptMaxSize = POINT { x: w.right - w.left + 2 * f, y: w.bottom - w.top + 2 * f };
+            }
             return LRESULT(0);
         }
         _ => {}
@@ -252,7 +264,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = DestroyWindow(hwnd);
             }
             T_BACKUP => a.write_backups(),
-            app::T_LOAD => a.redraw(),
+            app::T_LOAD | app::T_ANIM => a.redraw(),
             updater_ui::T_UPDATE => a.on_update_timer(),
             updater_ui::T_HANDSHAKE => a.on_handshake_timer(),
             updater_ui::T_CLEANUP => a.on_cleanup_timer(),
@@ -437,6 +449,7 @@ fn main() {
         let dpi = GetDpiForWindow(hwnd) as f32;
         let mut gfx = gfx::Gfx::new().expect("graphics");
         gfx.dark = settings::get().dark;
+        gfx.accent = settings::get().accent;
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
         let _ = gfx.create_target(hwnd, rc.right as u32, rc.bottom as u32, dpi);
@@ -462,8 +475,9 @@ fn main() {
         }
         app.reveal_caret();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
-        let m = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 1 };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        // A 1 px frame margin keeps the DWM drop shadow on the borderless window.
+        let m = windows::Win32::UI::Controls::MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 1 };
+        let _ = windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea(hwnd, &m);
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
         DragAcceptFiles(hwnd, true);
         let maximized = matches!(place, Some((.., true)));

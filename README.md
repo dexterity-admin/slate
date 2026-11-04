@@ -1,11 +1,14 @@
+<p align="center"><img src="res/slate-512.png" width="128" alt="Slate"></p>
+
 # Slate
 
 A small, fast text editor for Windows: the everyday Notepad++ feature set in a
-single 602 KB executable with a modern, fully custom-drawn interface.
+single ~700 KB executable with a modern, fully custom-drawn interface.
 
-- Single file, no installer, no runtime: `slate.exe`
-- Direct2D / DirectWrite rendering, light and dark themes (follows Windows on first run)
-- Zero CPU when idle: the caret is the Windows system caret, so blinking costs no repaints
+- **[Download the installer](https://github.com/dexterity-admin/slate/releases/latest)** (per-user, no admin rights) or the portable zip; Slate keeps itself up to date
+- Direct2D / DirectWrite rendering, light and dark themes (follows Windows on first run), seven accent colours
+- Its own vector icon set, file-type badges on tabs, smooth scrolling and gliding tab and panel transitions
+- Zero CPU when idle: animations run only while something moves, and the caret is the Windows system caret, so blinking costs no repaints
 
 ## Measured against Notepad++ (same machine, same files)
 
