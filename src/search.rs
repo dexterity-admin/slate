@@ -175,7 +175,7 @@ fn search_file(p: &Path, m: &Matcher, searched: &mut usize) -> Option<(usize, St
         return None;
     }
     *searched += 1;
-    let d = crate::enc::decode(&raw, None);
+    let d = crate::enc::decode(raw, None);
     let text = String::from_utf8_lossy(&d.text);
     let found = m.find_all(&text, 10_000);
     if found.is_empty() {

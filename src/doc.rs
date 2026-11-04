@@ -4,6 +4,69 @@
 
 const GAP_MIN: usize = 1 << 16;
 
+const LO: u64 = 0x0101_0101_0101_0101;
+const HI: u64 = 0x8080_8080_8080_8080;
+
+/// Calls `f` with the index of every `needle` byte, testing 8 bytes per step.
+/// (The zero-byte trick can flag a byte next to a real hit, so each
+/// candidate is checked.)
+#[inline]
+pub fn each_byte(hay: &[u8], needle: u8, mut f: impl FnMut(usize)) {
+    let pat = LO.wrapping_mul(needle as u64);
+    let mut chunks = hay.chunks_exact(8);
+    let mut base = 0;
+    for c in &mut chunks {
+        let v = u64::from_le_bytes(c.try_into().unwrap()) ^ pat;
+        let mut hit = v.wrapping_sub(LO) & !v & HI;
+        while hit != 0 {
+            let i = base + (hit.trailing_zeros() / 8) as usize;
+            if hay[i] == needle {
+                f(i);
+            }
+            hit &= hit - 1;
+        }
+        base += 8;
+    }
+    for (k, &b) in chunks.remainder().iter().enumerate() {
+        if b == needle {
+            f(base + k);
+        }
+    }
+}
+
+/// First index of `needle`, 8 bytes per step.
+pub fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
+    let pat = LO.wrapping_mul(needle as u64);
+    let mut chunks = hay.chunks_exact(8);
+    let mut base = 0;
+    for c in &mut chunks {
+        let v = u64::from_le_bytes(c.try_into().unwrap()) ^ pat;
+        if v.wrapping_sub(LO) & !v & HI != 0 {
+            if let Some(k) = c.iter().position(|&b| b == needle) {
+                return Some(base + k);
+            }
+        }
+        base += 8;
+    }
+    chunks.remainder().iter().position(|&b| b == needle).map(|k| base + k)
+}
+
+/// Gap reserved when a document of `len` bytes is loaded.
+fn initial_gap(len: usize) -> usize {
+    len.div_ceil(8).clamp(GAP_MIN, 1 << 20)
+}
+
+/// Reads a file into a buffer that already has room for the editing gap,
+/// so loading a large file never reallocates (and briefly doubles) it.
+pub fn read_for_doc(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut v = Vec::with_capacity(len + initial_gap(len) + 16);
+    f.read_to_end(&mut v)?;
+    Ok(v)
+}
+
 /// Raw bytes plus a movable insertion gap. One allocation for the whole document.
 pub struct Gap {
     pub buf: Vec<u8>,
@@ -13,7 +76,7 @@ pub struct Gap {
 
 impl Gap {
     pub fn from_bytes(data: Vec<u8>) -> Self {
-        let gap = data.len().div_ceil(8).clamp(GAP_MIN, 1 << 20);
+        let gap = initial_gap(data.len());
         let mut buf = data;
         let gs = buf.len();
         buf.reserve_exact(gap);
@@ -120,18 +183,17 @@ impl Doc {
     }
 
     pub fn scan(gap: &Gap) -> Vec<u32> {
-        let mut starts: Vec<u32> = vec![0];
         let (a, b) = (&gap.buf[..gap.gs], &gap.buf[gap.ge..]);
-        for (i, &c) in a.iter().enumerate() {
-            if c == b'\n' {
-                starts.push((i + 1) as u32);
-            }
-        }
-        for (i, &c) in b.iter().enumerate() {
-            if c == b'\n' {
-                starts.push((gap.gs + i + 1) as u32);
-            }
-        }
+        // Guess the line count from the first 64 KB so the index is sized once.
+        let sample = &a[..a.len().min(1 << 16)];
+        let mut n = 0usize;
+        each_byte(sample, b'\n', |_| n += 1);
+        let est = if sample.is_empty() { 1 } else { (gap.text_len() as u64 * (n as u64 + 1) / sample.len() as u64) as usize + 16 };
+        let mut starts: Vec<u32> = Vec::with_capacity(est);
+        starts.push(0);
+        each_byte(a, b'\n', |i| starts.push((i + 1) as u32));
+        let gs = gap.gs;
+        each_byte(b, b'\n', |i| starts.push((gs + i + 1) as u32));
         starts
     }
 
@@ -343,6 +405,33 @@ mod tests {
         assert_eq!(doc.line_of(8), 2);
         assert_eq!(doc.prev_char(7), 4);
         assert_eq!(doc.next_char(4), 7);
+    }
+
+    /// Phase timings for loading a large file named by SLATE_HUGE.
+    #[test]
+    fn huge_load_phases() {
+        let Some(p) = std::env::var_os("SLATE_HUGE") else { return };
+        let t = Instant::now();
+        let raw = read_for_doc(std::path::Path::new(&p)).unwrap();
+        let read = t.elapsed();
+        let t = Instant::now();
+        let enc = crate::enc::detect(&raw);
+        let detect = t.elapsed();
+        let t = Instant::now();
+        let d = crate::enc::decode(raw, Some(enc));
+        let decode = t.elapsed();
+        let t = Instant::now();
+        let doc = Doc::load(d.text);
+        let index = t.elapsed();
+        println!(
+            "bytes={} lines={} read={:?} detect={:?} decode+eol={:?} gap+index={:?}",
+            doc.len(),
+            doc.line_count(),
+            read,
+            detect,
+            decode,
+            index
+        );
     }
 
     #[test]

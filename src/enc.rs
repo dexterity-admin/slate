@@ -89,16 +89,28 @@ fn looks_utf16le(raw: &[u8]) -> bool {
     zeros * 10 > (n / 2) * 9
 }
 
-pub fn decode(raw: &[u8], force: Option<Enc>) -> Decoded {
-    let enc = force.unwrap_or_else(|| detect(raw));
+/// Valid UTF-8 is taken over as is; only invalid input is copied.
+fn utf8_owned(raw: Vec<u8>) -> Vec<u8> {
+    match String::from_utf8(raw) {
+        Ok(s) => s.into_bytes(),
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned().into_bytes(),
+    }
+}
+
+/// Decodes file bytes, reusing the allocation for UTF-8 files so a large
+/// file is never held twice.
+pub fn decode(mut raw: Vec<u8>, force: Option<Enc>) -> Decoded {
+    let enc = force.unwrap_or_else(|| detect(&raw));
     let text: Vec<u8> = match enc {
-        Enc::Utf8 => String::from_utf8_lossy(raw).into_owned().into_bytes(),
+        Enc::Utf8 => utf8_owned(raw),
         Enc::Utf8Bom => {
-            let body = raw.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(raw);
-            String::from_utf8_lossy(body).into_owned().into_bytes()
+            if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                raw.drain(..3);
+            }
+            utf8_owned(raw)
         }
         Enc::Utf16Le | Enc::Utf16Be => {
-            let mut body = raw;
+            let mut body = &raw[..];
             if body.starts_with(&[0xFF, 0xFE]) || body.starts_with(&[0xFE, 0xFF]) {
                 body = &body[2..];
             }
@@ -108,37 +120,44 @@ pub fn decode(raw: &[u8], force: Option<Enc>) -> Decoded {
                 .collect();
             String::from_utf16_lossy(&units).into_bytes()
         }
-        Enc::Ansi => ansi_to_utf8(raw),
+        Enc::Ansi => ansi_to_utf8(&raw),
     };
     let (text, eol, mixed_eol) = normalize_eol(text);
     Decoded { text, enc, eol, mixed_eol }
 }
 
 /// Converts CRLF and lone CR to LF, returning the dominant original style.
+/// Text between carriage returns moves as whole runs, and an LF-only file
+/// is left untouched.
 pub fn normalize_eol(mut t: Vec<u8>) -> (Vec<u8>, Eol, bool) {
-    let (mut crlf, mut lf, mut cr) = (0usize, 0usize, 0usize);
-    let mut w = 0;
-    let mut r = 0;
-    while r < t.len() {
-        let c = t[r];
-        if c == b'\r' {
-            if r + 1 < t.len() && t[r + 1] == b'\n' {
-                crlf += 1;
-                r += 1;
-            } else {
-                cr += 1;
-            }
-            t[w] = b'\n';
+    use crate::doc::{each_byte, find_byte};
+    let mut newlines = 0usize;
+    each_byte(&t, b'\n', |_| newlines += 1);
+    let Some(first) = find_byte(&t, b'\r') else {
+        let eol = if newlines > 0 { Eol::Lf } else { Eol::Crlf };
+        return (t, eol, false);
+    };
+    let (mut crlf, mut cr) = (0usize, 0usize);
+    let n = t.len();
+    let (mut w, mut r) = (first, first);
+    while r < n {
+        // t[r] is a carriage return.
+        if r + 1 < n && t[r + 1] == b'\n' {
+            crlf += 1;
+            r += 2;
         } else {
-            if c == b'\n' {
-                lf += 1;
-            }
-            t[w] = c;
+            cr += 1;
+            r += 1;
         }
+        t[w] = b'\n';
         w += 1;
-        r += 1;
+        let run = find_byte(&t[r..], b'\r').unwrap_or(n - r);
+        t.copy_within(r..r + run, w);
+        w += run;
+        r += run;
     }
     t.truncate(w);
+    let lf = newlines - crlf;
     let eol = if crlf == 0 && lf == 0 && cr == 0 {
         Eol::Crlf
     } else if crlf >= lf && crlf >= cr {
@@ -215,14 +234,77 @@ mod tests {
 
     #[test]
     fn eol_round_trip() {
-        let d = decode(b"a\r\nb\r\nc", None);
+        let d = decode(b"a\r\nb\r\nc".to_vec(), None);
         assert_eq!(d.text, b"a\nb\nc");
         assert_eq!(d.eol, Eol::Crlf);
         assert!(!d.mixed_eol);
         assert_eq!(encode(&d.text, d.enc, d.eol), b"a\r\nb\r\nc");
-        let m = decode(b"a\nb\r\nc\rd", None);
+        let m = decode(b"a\nb\r\nc\rd".to_vec(), None);
         assert!(m.mixed_eol);
         assert_eq!(m.text, b"a\nb\nc\nd");
+    }
+
+    /// The run-based normaliser must match a plain byte-by-byte one.
+    #[test]
+    fn eol_normaliser_matches_reference() {
+        fn reference(t: &[u8]) -> (Vec<u8>, usize, usize, usize) {
+            let (mut out, mut crlf, mut lf, mut cr) = (Vec::new(), 0, 0, 0);
+            let mut i = 0;
+            while i < t.len() {
+                match t[i] {
+                    b'\r' if i + 1 < t.len() && t[i + 1] == b'\n' => {
+                        crlf += 1;
+                        out.push(b'\n');
+                        i += 1;
+                    }
+                    b'\r' => {
+                        cr += 1;
+                        out.push(b'\n');
+                    }
+                    b'\n' => {
+                        lf += 1;
+                        out.push(b'\n');
+                    }
+                    c => out.push(c),
+                }
+                i += 1;
+            }
+            (out, crlf, lf, cr)
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for len in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 300, 4097] {
+            for _ in 0..40 {
+                let t: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        [b'a', b'\r', b'\n', b'x', b'\r', 0xC3, 0xA9][(state >> 59) as usize % 7]
+                    })
+                    .collect();
+                let (want, crlf, lf, cr) = reference(&t);
+                let (got, eol, mixed) = normalize_eol(t.clone());
+                assert_eq!(got, want, "len {len}");
+                assert_eq!(mixed, [crlf, lf, cr].iter().filter(|&&n| n > 0).count() > 1);
+                if crlf + lf + cr > 0 {
+                    let best = *[crlf, lf, cr].iter().max().unwrap();
+                    let n = match eol {
+                        Eol::Crlf => crlf,
+                        Eol::Lf => lf,
+                        Eol::Cr => cr,
+                    };
+                    assert_eq!(n, best);
+                }
+                let mut naive = Vec::new();
+                for (i, &b) in t.iter().enumerate() {
+                    if b == b'\n' {
+                        naive.push(i);
+                    }
+                }
+                let mut fast = Vec::new();
+                crate::doc::each_byte(&t, b'\n', |i| fast.push(i));
+                assert_eq!(fast, naive);
+                assert_eq!(crate::doc::find_byte(&t, b'\r'), t.iter().position(|&b| b == b'\r'));
+            }
+        }
     }
 
     #[test]
@@ -232,7 +314,7 @@ mod tests {
         for u in "hé€\r\n".encode_utf16() {
             raw.extend_from_slice(&u.to_le_bytes());
         }
-        let d = decode(&raw, None);
+        let d = decode(raw.clone(), None);
         assert_eq!(d.enc, Enc::Utf16Le);
         assert_eq!(d.text, src.as_bytes());
         assert_eq!(encode(&d.text, d.enc, d.eol), raw);

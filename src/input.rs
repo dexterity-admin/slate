@@ -285,8 +285,11 @@ impl App {
         let Ok(m) = q.compile() else { return };
         let b = self.cur();
         let from = b.primary().lo();
-        let text = String::from_utf8_lossy(b.doc.gap.contiguous()).into_owned();
-        if let Some((a, z)) = m.find_from(&text, from).or_else(|| m.find_from(&text, 0)) {
+        let hit = {
+            let text = String::from_utf8_lossy(b.doc.gap.contiguous());
+            m.find_from(&text, from).or_else(|| m.find_from(&text, 0))
+        };
+        if let Some((a, z)) = hit {
             b.sels = vec![Sel { anchor: a, head: z }];
             self.reveal_caret();
         }

@@ -20,8 +20,8 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 def main() -> None:
     dist, version, notes_file = sys.argv[1], sys.argv[2], sys.argv[3]
     exe = open(os.path.join(dist, "slate.exe"), "rb").read()
-    with open(notes_file, encoding="utf-8") as f:
-        notes = f.read().strip()
+    with open(notes_file, encoding="utf-8-sig") as f:
+        notes = f.read().replace("﻿", "").strip()
     manifest = json.dumps(
         {
             "version": version,

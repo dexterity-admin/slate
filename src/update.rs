@@ -75,6 +75,13 @@ fn json_field(s: &str, key: &str) -> Option<String> {
                 '\\' => match chars.next()? {
                     'n' => out.push('\n'),
                     't' => out.push('\t'),
+                    'u' => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        let c = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
+                        if c != '\u{FEFF}' {
+                            out.push(c);
+                        }
+                    }
                     c => out.push(c),
                 },
                 c => out.push(c),
@@ -344,6 +351,13 @@ mod tests {
         assert_eq!(m.size, 602112);
         assert!(m.sha256.starts_with("ab12"));
         assert_eq!(m.notes, "Fixes \"x\"\nmore");
+        // JSON escapes for U+FEFF and U+00E9, built from char codes.
+        let bs = char::from(92u8);
+        let json = format!(
+            r#"{{"version":"1.2.0","size":1,"sha256":"ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12","notes":"{bs}ufeffFirst {bs}u00e9"}}"#
+        );
+        let m = parse_manifest(&json).unwrap();
+        assert_eq!(m.notes, format!("First {}", char::from_u32(0xE9).unwrap()));
         assert!(parse_manifest(r#"{"version":"1","size":0,"sha256":"x"}"#).is_none());
         assert_eq!(b64decode("aGVsbG8=").unwrap(), b"hello");
     }

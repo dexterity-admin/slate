@@ -541,7 +541,7 @@ impl App {
             self.after_switch();
             return true;
         }
-        let raw = match std::fs::read(&pb) {
+        let raw = match crate::doc::read_for_doc(&pb) {
             Ok(r) => r,
             Err(e) => {
                 self.flash(&format!("Cannot open {}: {e}", pb.display()));
@@ -549,7 +549,7 @@ impl App {
             }
         };
         let replace = self.pristine_active();
-        let d = enc::decode(&raw, None);
+        let d = enc::decode(raw, None);
         let id = self.new_buffer(d.text);
         {
             let b = self.bufs.last_mut().unwrap();
@@ -891,9 +891,10 @@ impl App {
                 self.next_untitled = self.next_untitled.max(b.untitled + 1);
                 id
             } else if let Some(p) = &path {
-                let Ok(raw) = std::fs::read(p) else { continue };
+                let Ok(raw) = crate::doc::read_for_doc(Path::new(p)) else { continue };
                 let force = t.get("enc").and_then(|e| Enc::from_name(e));
-                let d = enc::decode(&raw, force.filter(|e| *e == enc::detect(&raw) || *e == Enc::Ansi));
+                let detected = enc::detect(&raw);
+                let d = enc::decode(raw, force.filter(|e| *e == detected || *e == Enc::Ansi));
                 let id = self.new_buffer(d.text);
                 let b = self.bufs.last_mut().unwrap();
                 b.enc = d.enc;
@@ -984,8 +985,8 @@ impl App {
     pub fn reload(&mut self, id: u32, force: Option<Enc>) {
         let i = self.bi(id);
         let Some(p) = self.bufs[i].path.clone() else { return };
-        let Ok(raw) = std::fs::read(&p) else { return };
-        let d = enc::decode(&raw, force);
+        let Ok(raw) = crate::doc::read_for_doc(&p) else { return };
+        let d = enc::decode(raw, force);
         let old = &self.bufs[i];
         let caret = old.caret();
         let mut nb = Buffer::new(id, d.text);
@@ -1066,10 +1067,8 @@ impl App {
         self.last_find = q.clone();
         let (count, err) = match q.compile() {
             Ok(m) => {
-                let b = self.cur();
-                let text = b.doc.gap.contiguous();
-                let s = std::str::from_utf8(text).map(|s| s.to_string()).unwrap_or_default();
-                (Some(m.find_all(&s, 100_000).len()), None)
+                let text = String::from_utf8_lossy(self.cur().doc.gap.contiguous());
+                (Some(m.find_all(&text, 100_000).len()), None)
             }
             Err(e) if e.is_empty() => (None, None),
             Err(e) => (None, Some(e)),
@@ -1092,11 +1091,14 @@ impl App {
         self.last_find = q;
         let b = self.cur();
         let p = b.primary();
-        let text = String::from_utf8_lossy(b.doc.gap.contiguous()).into_owned();
-        let hit = if forward {
-            m.find_from(&text, p.hi()).or_else(|| m.find_from(&text, 0))
-        } else {
-            m.find_before(&text, p.lo()).or_else(|| m.find_before(&text, text.len() + 1))
+        // Borrowed, not copied: valid UTF-8 needs no allocation.
+        let hit = {
+            let text = String::from_utf8_lossy(b.doc.gap.contiguous());
+            if forward {
+                m.find_from(&text, p.hi()).or_else(|| m.find_from(&text, 0))
+            } else {
+                m.find_before(&text, p.lo()).or_else(|| m.find_before(&text, text.len() + 1))
+            }
         };
         match hit {
             Some((a, z)) => {
@@ -1117,9 +1119,12 @@ impl App {
         let Ok(m) = q.compile() else { return };
         let b = self.cur();
         let p = b.primary();
-        let text = String::from_utf8_lossy(b.doc.gap.contiguous()).into_owned();
-        if !p.is_empty() && m.find_from(&text, p.lo()) == Some((p.lo(), p.hi())) {
-            let r = m.expand(&q, &text, (p.lo(), p.hi()), &repl);
+        let r = {
+            let text = String::from_utf8_lossy(b.doc.gap.contiguous());
+            (!p.is_empty() && m.find_from(&text, p.lo()) == Some((p.lo(), p.hi())))
+                .then(|| m.expand(&q, &text, (p.lo(), p.hi()), &repl))
+        };
+        if let Some(r) = r {
             b.apply(vec![(p.lo(), p.hi(), r.into_bytes())], EditKind::Other);
             self.edited();
         }
@@ -1134,10 +1139,11 @@ impl App {
         self.repl_text = repl.clone();
         let Ok(m) = q.compile() else { return };
         let b = self.cur();
-        let text = String::from_utf8_lossy(b.doc.gap.contiguous()).into_owned();
-        let hits = m.find_all(&text, usize::MAX);
-        let n = hits.len();
-        let ch: Vec<_> = hits.into_iter().map(|r| (r.0, r.1, m.expand(&q, &text, r, &repl).into_bytes())).collect();
+        let ch: Vec<_> = {
+            let text = String::from_utf8_lossy(b.doc.gap.contiguous());
+            m.find_all(&text, usize::MAX).into_iter().map(|r| (r.0, r.1, m.expand(&q, &text, r, &repl).into_bytes())).collect()
+        };
+        let n = ch.len();
         b.apply(ch, EditKind::Other);
         self.edited();
         self.recount();
