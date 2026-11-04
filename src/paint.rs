@@ -1,0 +1,603 @@
+//! Frame rendering: title bar, tab strips, editors, status bar, overlays.
+
+use crate::app::{App, Hit, Input, PalMode, CAP_W, SCROLL_W, STATUS_H, TAB_H, TITLE_H};
+use crate::gfx::{rect, C};
+use crate::settings;
+use crate::syntax::LANGS;
+use crate::ui::*;
+use windows::Win32::Foundation::BOOL;
+use windows::Win32::Graphics::Direct2D::Common::D2D_POINT_2F;
+use windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE;
+use windows::Win32::Graphics::DirectWrite::{DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_ALIGNMENT_TRAILING};
+
+const D2DERR_RECREATE_TARGET: i32 = 0x8899000Cu32 as i32;
+
+impl App {
+    pub fn paint(&mut self) {
+        if self.gfx.rt.is_none() || self.views[0].tabs.is_empty() {
+            return;
+        }
+        self.cache_tick += 1;
+        self.caret_target.set(None);
+        unsafe {
+            self.gfx.rt().BeginDraw();
+            self.gfx.rt().Clear(Some(&self.gfx.color(C::Bg)));
+        }
+        let views = if self.split { 2 } else { 1 };
+        for v in 0..views {
+            self.paint_view(v);
+        }
+        if self.split {
+            let sx = self.view_rect(1).0 - 1.0;
+            self.gfx.fill(sx, TITLE_H, 1.0, self.h - TITLE_H - STATUS_H, C::Border);
+        }
+        self.paint_title();
+        self.paint_status();
+        self.paint_find();
+        self.paint_palette();
+        let r = unsafe { self.gfx.rt().EndDraw(None, None) };
+        if let Err(e) = r {
+            if e.code().0 == D2DERR_RECREATE_TARGET {
+                self.gfx.drop_target();
+                self.cache.clear();
+            }
+        }
+        self.sync_caret();
+    }
+
+    /// Places the Windows caret at the focused element. Windows blinks it,
+    /// so an idle window never repaints.
+    fn sync_caret(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{CreateCaret, DestroyCaret, HideCaret, SetCaretPos, ShowCaret};
+        let target = if self.focused { self.caret_target.get() } else { None };
+        unsafe {
+            match target {
+                Some((x, y, w, h)) => {
+                    let s = self.scale;
+                    let size = ((w * s).round().max(1.0) as i32, (h * s).round() as i32);
+                    if self.sys_caret != Some(size) {
+                        let _ = DestroyCaret();
+                        let _ = CreateCaret(self.hwnd, None, size.0, size.1);
+                        self.sys_caret = Some(size);
+                        self.caret_shown = false;
+                    }
+                    let _ = SetCaretPos((x * s).round() as i32, (y * s).round() as i32);
+                    if !self.caret_shown {
+                        let _ = ShowCaret(self.hwnd);
+                        self.caret_shown = true;
+                    }
+                }
+                None => {
+                    if self.caret_shown {
+                        let _ = HideCaret(self.hwnd);
+                        self.caret_shown = false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn paint_title(&self) {
+        let g = &self.gfx;
+        g.fill(0.0, 0.0, self.w, TITLE_H, C::Chrome);
+        if self.hover == Hit::Menu {
+            g.fill(0.0, 0.0, MENU_W, TITLE_H, C::Hover);
+        }
+        g.icon('\u{E700}', 0.0, 0.0, MENU_W, TITLE_H, C::Fg, false);
+        // Logo: a rounded slate tile.
+        g.fill_round(MENU_W + 2.0, 9.0, 16.0, 16.0, 4.0, C::Accent);
+        g.text("S", g.ui_bold.as_ref().unwrap(), MENU_W + 6.5, 8.0, 12.0, 18.0, C::OnAccent);
+        let b = self.cur_ref();
+        let name = match &b.path {
+            Some(p) => p.display().to_string(),
+            None => b.name(),
+        };
+        let title = format!("{name}{}", if b.dirty() { "  •" } else { "" });
+        let tx = MENU_W + 28.0;
+        let tw = self.w - tx - 3.0 * CAP_W - 16.0;
+        g.text(&title, g.ui.as_ref().unwrap(), tx, 0.0, tw, TITLE_H, C::Dim);
+        if self.recording.is_some() {
+            let rw = 120.0;
+            g.fill_round(self.w - 3.0 * CAP_W - rw - 10.0, 8.0, rw, 18.0, 9.0, C::Danger);
+            g.text("●  Recording macro", g.ui_small.as_ref().unwrap(), self.w - 3.0 * CAP_W - rw, 8.0, rw, 18.0, C::OnAccent);
+        }
+        for (h, rc) in self.caption_buttons() {
+            let hovered = self.hover == h;
+            if hovered {
+                g.fill(rc.x, rc.y, rc.w, rc.h, if h == Hit::Close { C::Danger } else { C::Hover });
+            }
+            let glyph = match h {
+                Hit::Min => '\u{E921}',
+                Hit::Max => {
+                    if self.maximized {
+                        '\u{E923}'
+                    } else {
+                        '\u{E922}'
+                    }
+                }
+                _ => '\u{E8BB}',
+            };
+            let c = if hovered && h == Hit::Close { C::OnAccent } else { C::Fg };
+            g.icon(glyph, rc.x, rc.y, rc.w, rc.h, c, false);
+        }
+        g.fill(0.0, TITLE_H - 1.0, self.w, 1.0, C::Border);
+    }
+
+    fn paint_tabs(&self, v: usize) {
+        let g = &self.gfx;
+        let (vx, vy, vw, _) = self.view_rect(v);
+        g.fill(vx, vy, vw, TAB_H, C::Tabs);
+        g.fill(vx, vy + TAB_H - 1.0, vw, 1.0, C::Border);
+        let (tabs, plus) = self.tab_layout(v);
+        g.clip(vx, vy, vw, TAB_H);
+        let focused_view = v == self.av;
+        for (i, t) in tabs.iter().enumerate() {
+            let tab = &self.views[v].tabs[i];
+            let b = &self.bufs[self.bi(tab.buf)];
+            let active = i == self.views[v].active;
+            let hovered = matches!(self.hover, Hit::Tab(hv, hi) | Hit::TabClose(hv, hi) if hv == v && hi == i);
+            if active {
+                g.fill_round(t.x, t.y, t.w, t.h + 6.0, 6.0, C::Bg);
+                g.fill(t.x, t.y + t.h - 1.0, t.w, 1.0, C::Bg);
+                g.fill_round(t.x + 8.0, t.y, t.w - 16.0, 2.0, 1.0, if focused_view { C::Accent } else { C::Faint });
+            } else if hovered {
+                g.fill_round(t.x, t.y + 2.0, t.w, t.h - 6.0, 6.0, C::Hover);
+            }
+            let fg = if active { C::Fg } else { C::Dim };
+            let name = b.name();
+            let f = if active { g.ui_bold.as_ref() } else { g.ui.as_ref() };
+            g.text(&name, f.unwrap(), t.x + 12.0, t.y, t.w - 40.0, t.h - 1.0, fg);
+            let cr = Self::tab_close_rect(t);
+            let close_hover = self.hover == Hit::TabClose(v, i);
+            if close_hover {
+                g.fill_round(cr.x, cr.y, cr.w, cr.h, 4.0, C::Hover);
+            }
+            if b.dirty() && !hovered && Some(b.id) != self.results_buf {
+                g.fill_round(cr.x + 6.0, cr.y + 6.0, 8.0, 8.0, 4.0, if active { C::Accent } else { C::Dim });
+            } else if active || hovered {
+                g.icon('\u{E8BB}', cr.x, cr.y, cr.w, cr.h, if close_hover { C::Fg } else { C::Dim }, true);
+            }
+        }
+        if self.hover == Hit::NewTab(v) {
+            g.fill_round(plus.x, plus.y, plus.w, plus.h, 5.0, C::Hover);
+        }
+        g.icon('\u{E710}', plus.x, plus.y, plus.w, plus.h, C::Dim, true);
+        g.unclip();
+    }
+
+    fn paint_view(&mut self, v: usize) {
+        self.paint_tabs(v);
+        let (vx, _, vw, _) = self.view_rect(v);
+        let (tx, ty, tw, th) = self.text_rect(v);
+        let rows = self.rows(v);
+        let bi = self.bi(self.tab(v).buf);
+        let wrap = self.wrap_width(v);
+        let lh = self.gfx.line_h;
+        let sx = self.tab(v).x;
+        let gw = self.gutter_w(v);
+        let active = v == self.av;
+        let show_ws = settings::get().show_ws;
+        let (prim, single, n_sels) = {
+            let b = &self.bufs[bi];
+            (b.primary(), b.sels.len() == 1 && b.primary().is_empty(), b.sels.len())
+        };
+        let caret_line = self.bufs[bi].doc.line_of(prim.head);
+
+        // Words to mark: find query when the panel is open, else the selected word.
+        let marker = match &self.find {
+            Some(fb) if active && !fb.fields[0].text.is_empty() => fb.query().compile().ok(),
+            _ => {
+                let b = &self.bufs[bi];
+                if n_sels == 1 && !prim.is_empty() && prim.hi() - prim.lo() < 200 {
+                    let t = b.doc.text(prim.lo(), prim.hi());
+                    let word = t.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80);
+                    if word {
+                        crate::search::Query { pat: String::from_utf8_lossy(&t).into_owned(), case: true, word: true, regex: false }.compile().ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        let bracket = if active { crate::edit::match_bracket(&self.bufs[bi], prim.head) } else { None };
+
+        self.gfx.clip(vx, ty, vw, th);
+        let mut line_buf = Vec::new();
+        for row in &rows {
+            let b = &self.bufs[bi];
+            let Some(l) = self.cache.get(&row.key) else { continue };
+            let ls = b.doc.line_start(row.line);
+            let le = b.doc.line_end(row.line);
+            let row_h = row.rows as f32 * lh;
+            if single && row.line == caret_line {
+                self.gfx.fill(vx, row.y, vw - SCROLL_W, row_h, C::CurLine);
+            }
+            let ox = tx - sx;
+            // Selections.
+            for s in &b.sels {
+                if s.is_empty() || s.hi() < ls || s.lo() > le + 1 {
+                    continue;
+                }
+                let a = s.lo().max(ls) - ls;
+                let z = s.hi().min(le) - ls;
+                let fill = if active { C::Sel } else { C::SelDim };
+                self.fill_range(l, a, z, ox, row.y, fill);
+                if s.hi() > le && s.lo() <= le {
+                    let (ex, ey) = self.end_xy(l);
+                    self.gfx.fill(ox + ex, row.y + ey, self.gfx.char_w * 0.6, lh, fill);
+                }
+            }
+            // Search / same-word marks.
+            if let Some(m) = &marker {
+                b.doc.gap.copy_range(ls, le, &mut line_buf);
+                let text = String::from_utf8_lossy(&line_buf);
+                for (a, z) in m.find_all(&text, 500) {
+                    if a + ls == prim.lo() && z + ls == prim.hi() {
+                        continue;
+                    }
+                    self.fill_range(l, a, z, ox, row.y, C::Match);
+                }
+            }
+            if let Some((p, q)) = bracket {
+                for at in [p, q] {
+                    if at >= ls && at < le {
+                        let (x0, y0) = self.xy16(l, l.to16(at - ls));
+                        let (x1, _) = self.xy16(l, l.to16(at + 1 - ls));
+                        self.gfx.stroke_round(ox + x0 - 0.5, row.y + y0, x1 - x0 + 1.0, lh, 2.0, C::Dim, 1.0);
+                    }
+                }
+            }
+            unsafe {
+                self.gfx.rt().DrawTextLayout(D2D_POINT_2F { x: ox, y: row.y }, &l.layout, self.gfx.b(C::Fg), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+            if show_ws {
+                b.doc.gap.copy_range(ls, le, &mut line_buf);
+                for (k, &c) in line_buf.iter().enumerate() {
+                    if c == b'\t' {
+                        let (x0, y0) = self.xy16(l, l.to16(k));
+                        let (x1, _) = self.xy16(l, l.to16(k + 1));
+                        let my = row.y + y0 + lh / 2.0;
+                        self.gfx.line(ox + x0 + 2.0, my, ox + x1.max(x0 + 6.0) - 3.0, my, C::Faint, 1.0);
+                    }
+                }
+                if row.line + 1 < b.doc.line_count() {
+                    let (ex, ey) = self.end_xy(l);
+                    self.gfx.text("¬", self.gfx.mono.as_ref().unwrap(), ox + ex + 1.0, row.y + ey, 20.0, lh, C::Faint);
+                }
+            }
+            if b.is_folded(row.line) {
+                let (ex, ey) = self.end_xy(l);
+                let fx = ox + ex + 8.0;
+                self.gfx.fill_round(fx, row.y + ey + 2.0, 30.0, lh - 4.0, 4.0, C::SelDim);
+                self.gfx.text("⋯", self.gfx.ui.as_ref().unwrap(), fx + 8.0, row.y + ey, 30.0, lh, C::Dim);
+            }
+        }
+        // Carets: the primary one is the system caret, extra ones are drawn.
+        if active && self.palette.is_none() && !self.in_find {
+            let b = &self.bufs[bi];
+            let n = b.sels.len();
+            let carets: Vec<(usize, usize)> = b.sels.iter().map(|s| (b.doc.line_of(s.head), s.head)).collect();
+            for (k, (line, pos)) in carets.into_iter().enumerate() {
+                let Some(row) = rows.iter().find(|r| r.line == line) else { continue };
+                let (x, y) = self.pos_xy(bi, line, pos, wrap);
+                let cx = tx - sx + x;
+                let cy = row.y + y;
+                if cx < tx - 1.0 || cx > tx + tw || cy + lh <= ty || cy >= ty + th {
+                    continue;
+                }
+                if k + 1 == n {
+                    let cell = self.gfx.char_w.max(2.0);
+                    self.caret_target.set(Some(if self.overtype { (cx, cy + lh - 3.0, cell, 2.0) } else { (cx - 0.5, cy + 1.0, 2.0, lh - 2.0) }));
+                } else {
+                    self.gfx.fill(cx - 0.5, cy + 1.0, 2.0, lh - 2.0, C::Accent);
+                }
+            }
+        }
+        self.gfx.unclip();
+
+        // Gutter.
+        let g = &self.gfx;
+        g.clip(vx, ty, gw, th);
+        g.fill(vx, ty, gw, th, C::Bg);
+        let b = &self.bufs[bi];
+        let num_fmt = g.mono_num.as_ref().unwrap();
+        let gutter_hover = self.hover == Hit::Gutter(v);
+        for row in &rows {
+            if single && row.line == caret_line {
+                g.fill(vx, row.y, gw, row.rows as f32 * lh, C::CurLine);
+            }
+            if b.bookmarks.binary_search(&row.line).is_ok() {
+                g.fill_round(vx + 5.0, row.y + lh / 2.0 - 4.5, 9.0, 9.0, 4.5, C::Accent);
+            }
+            let num = (row.line + 1).to_string();
+            let fg = if row.line == caret_line { C::Fg } else { C::Faint };
+            g.text(&num, num_fmt, vx + 14.0, row.y, gw - 14.0 - 22.0, lh, fg);
+            let folded = b.is_folded(row.line);
+            if folded || (gutter_hover && b.fold_end(row.line).is_some()) {
+                let glyph = if folded { '\u{E76C}' } else { '\u{E70D}' };
+                g.icon(glyph, vx + gw - 20.0, row.y, 16.0, lh, if folded { C::Accent } else { C::Dim }, true);
+            }
+        }
+        g.unclip();
+
+        // Scrollbar.
+        if let Some((y, h)) = self.thumb(v) {
+            let x = vx + vw - SCROLL_W;
+            let hot = matches!(self.hover, Hit::VScroll(hv) if hv == v) || matches!(self.drag, crate::app::Drag::Scroll { view, .. } if view == v);
+            g.fill_round(x + 3.0, y + 2.0, SCROLL_W - 6.0, h - 4.0, 3.0, if hot { C::Dim } else { C::Faint });
+            // Bookmark ticks along the track.
+            let n = b.doc.line_count().max(1) as f32;
+            for &bm in &b.bookmarks {
+                let by = ty + th * bm as f32 / n;
+                g.fill(x + 2.0, by, SCROLL_W - 4.0, 2.0, C::Accent);
+            }
+        }
+        let _ = wrap;
+    }
+
+    fn fill_range(&self, l: &crate::app::LineLayout, a: usize, z: usize, ox: f32, oy: f32, c: C) {
+        let (a16, z16) = (l.to16(a), l.to16(z));
+        if z16 <= a16 {
+            return;
+        }
+        let mut m = [DWRITE_HIT_TEST_METRICS::default(); 16];
+        let mut n = 0u32;
+        unsafe {
+            if l.layout.HitTestTextRange(a16, z16 - a16, 0.0, 0.0, Some(&mut m), &mut n).is_err() {
+                return;
+            }
+        }
+        for r in &m[..(n as usize).min(16)] {
+            self.gfx.fill(ox + r.left, oy + r.top, r.width.max(2.0), self.gfx.line_h, c);
+        }
+    }
+
+    fn xy16(&self, l: &crate::app::LineLayout, i16: u32) -> (f32, f32) {
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        unsafe {
+            let _ = l.layout.HitTestTextPosition(i16, BOOL(0), &mut x, &mut y, &mut m);
+        }
+        (x, y)
+    }
+
+    /// End of a layout's last row.
+    fn end_xy(&self, l: &crate::app::LineLayout) -> (f32, f32) {
+        let n = (l.map.len() - 1) as u32;
+        self.xy16(l, n)
+    }
+
+    fn paint_status(&mut self) {
+        let y = self.h - STATUS_H;
+        let mut segs: Vec<(String, u8)> = Vec::new();
+        {
+            let b = self.cur_ref();
+            let p = b.caret();
+            let (l, _) = b.line_col(p);
+            let col = b.display_col(p) + 1;
+            let selected: usize = b.sels.iter().map(|s| s.hi() - s.lo()).sum();
+            let mut pos = format!("Ln {}, Col {}", l + 1, col);
+            if b.sels.len() > 1 {
+                pos += &format!("  ({} carets)", b.sels.len());
+            } else if selected > 0 {
+                pos += &format!("  ({selected} selected)");
+            }
+            let s = settings::get();
+            if let Some(m) = &self.upd.available {
+                segs.push((format!("Update {}", m.version), 9));
+            }
+            if self.recording.is_some() {
+                segs.push(("● REC".into(), 8));
+            }
+            if self.overtype {
+                segs.push(("OVR".into(), 7));
+            }
+            if s.wrap {
+                segs.push(("Wrap".into(), 6));
+            }
+            if s.zoom != 0 {
+                let pct = ((s.font_size + s.zoom as f32) / s.font_size * 100.0).round();
+                segs.push((format!("{pct}%"), 5));
+            }
+            segs.push((pos, 0));
+            segs.push((format!("{}: {}", if s.use_tabs { "Tabs" } else { "Spaces" }, s.tab_size), 1));
+            segs.push((b.enc.name().to_string(), 2));
+            segs.push((format!("{}{}", b.eol.name(), if b.mixed_eol { " (mixed)" } else { "" }), 3));
+            segs.push((LANGS[b.lang].name.to_string(), 4));
+        }
+        let g = &self.gfx;
+        g.fill(0.0, y, self.w, STATUS_H, C::Chrome);
+        g.fill(0.0, y, self.w, 1.0, C::Border);
+        let small = g.ui_small.as_ref().unwrap();
+        let mut x = self.w - 8.0;
+        let mut hits = Vec::new();
+        for (text, id) in segs.iter().rev() {
+            let w = self.text_w(text, true) + 18.0;
+            x -= w;
+            if *id == 9 {
+                g.fill_round(x + 3.0, y + 3.0, w - 6.0, STATUS_H - 6.0, 4.0, C::Accent);
+            } else if self.hover == Hit::Status(*id as usize) {
+                g.fill(x, y + 1.0, w, STATUS_H - 1.0, C::Hover);
+            }
+            let c = match *id {
+                8 => C::Danger,
+                9 => C::OnAccent,
+                _ => C::Dim,
+            };
+            g.text(text, small, x + 9.0, y, w, STATUS_H, c);
+            hits.push((x, x + w, *id));
+        }
+        let left = match &self.status {
+            Some(s) => s.clone(),
+            None => {
+                let b = self.cur_ref();
+                let n = b.doc.line_count();
+                format!("{} lines  ·  {} bytes", n, b.doc.len())
+            }
+        };
+        g.text(&left, small, 12.0, y, (x - 24.0).max(0.0), STATUS_H, C::Dim);
+        self.status_segs = hits;
+    }
+
+    fn draw_input(&self, inp: &Input, rc: &Rect, focused: bool, placeholder: &str, right_pad: f32) {
+        let g = &self.gfx;
+        g.fill_round(rc.x, rc.y, rc.w, rc.h, 5.0, C::Bg);
+        g.stroke_round(rc.x, rc.y, rc.w, rc.h, 5.0, if focused { C::Accent } else { C::Border }, 1.0);
+        let f = g.ui.as_ref().unwrap();
+        let tx = rc.x + 8.0;
+        let tw = rc.w - 16.0 - right_pad;
+        if inp.text.is_empty() {
+            g.text(placeholder, f, tx, rc.y, tw, rc.h, C::Faint);
+        }
+        let u: Vec<u16> = inp.text.encode_utf16().collect();
+        let Ok(lay) = (unsafe { g.dw.CreateTextLayout(&u, f, 10000.0, rc.h) }) else { return };
+        let to16 = |b: usize| inp.text[..b].encode_utf16().count() as u32;
+        let pos = |i: u32| {
+            let (mut x, mut y) = (0.0, 0.0);
+            let mut m = DWRITE_HIT_TEST_METRICS::default();
+            unsafe {
+                let _ = lay.HitTestTextPosition(i, BOOL(0), &mut x, &mut y, &mut m);
+            }
+            x
+        };
+        let cx = pos(to16(inp.caret));
+        let shift = (cx - tw + 4.0).max(0.0);
+        g.clip(tx, rc.y, tw, rc.h);
+        let (a, z) = inp.sel();
+        if focused && a != z {
+            let (x0, x1) = (pos(to16(a)), pos(to16(z)));
+            g.fill(tx + x0 - shift, rc.y + 4.0, x1 - x0, rc.h - 8.0, C::Sel);
+        }
+        unsafe {
+            g.rt().DrawTextLayout(D2D_POINT_2F { x: tx - shift, y: rc.y }, &lay, g.b(C::Fg), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        if focused {
+            self.caret_target.set(Some((tx + cx - shift, rc.y + 6.0, 2.0, rc.h - 12.0)));
+        }
+        g.unclip();
+    }
+
+    fn panel(&self, rc: &Rect) {
+        let g = &self.gfx;
+        for (i, c) in [C::Chrome, C::Border].iter().enumerate() {
+            let d = 3.0 - i as f32 * 2.0;
+            g.fill_round(rc.x - d + 1.0, rc.y - d + 3.0, rc.w + 2.0 * d - 2.0, rc.h + 2.0 * d - 2.0, 9.0, *c);
+        }
+        g.fill_round(rc.x, rc.y, rc.w, rc.h, 8.0, C::Popup);
+        g.stroke_round(rc.x, rc.y, rc.w, rc.h, 8.0, C::Border, 1.0);
+    }
+
+    fn paint_find(&self) {
+        let Some((panel, fields, btns)) = self.find_layout() else { return };
+        let fb = self.find.as_ref().unwrap();
+        let g = &self.gfx;
+        self.panel(&panel);
+        let ui = g.ui.as_ref().unwrap();
+        let small = g.ui_small.as_ref().unwrap();
+        for (id, rc) in &fields {
+            let ph = match id {
+                0 => "Find",
+                1 => "Replace",
+                2 => "Folder",
+                _ => "Filters, e.g. *.rs;*.txt",
+            };
+            let pad = if *id == 0 { 76.0 } else { 0.0 };
+            self.draw_input(&fb.fields[*id], rc, self.in_find && fb.focus == *id, ph, pad);
+            if *id == 0 && !fb.fif {
+                let label = match (&fb.err, fb.count) {
+                    (Some(_), _) => "Bad regex".to_string(),
+                    (None, Some(0)) => "No results".to_string(),
+                    (None, Some(n)) => format!("{n} found"),
+                    (None, None) => String::new(),
+                };
+                let c = if fb.err.is_some() || fb.count == Some(0) { C::Danger } else { C::Dim };
+                g.text(&label, small, rc.x + rc.w + 8.0, rc.y, 64.0, rc.h, c);
+            }
+        }
+        for (id, rc) in &btns {
+            let hovered = self.hover == Hit::FindBtn(*id);
+            let on = match *id {
+                FB_CASE => fb.case,
+                FB_WORD => fb.word,
+                FB_REGEX => fb.regex,
+                _ => false,
+            };
+            if on {
+                g.fill_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::SelDim);
+                g.stroke_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::Accent, 1.0);
+            } else if hovered {
+                g.fill_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::Hover);
+            }
+            let fg = if on { C::Accent } else { C::Fg };
+            match *id {
+                FB_CASE => g.text("Aa", small, rc.x + 3.0, rc.y, rc.w, rc.h, fg),
+                FB_WORD => g.text("ab", small, rc.x + 4.0, rc.y, rc.w, rc.h, fg),
+                FB_REGEX => g.text(".*", ui, rc.x + 6.0, rc.y, rc.w, rc.h, fg),
+                FB_PREV => g.icon('\u{E70E}', rc.x, rc.y, rc.w, rc.h, C::Fg, true),
+                FB_NEXT => g.icon('\u{E70D}', rc.x, rc.y, rc.w, rc.h, C::Fg, true),
+                FB_CLOSE => g.icon('\u{E8BB}', rc.x, rc.y, rc.w, rc.h, C::Fg, true),
+                FB_MODE => g.icon(if fb.replace { '\u{E70D}' } else { '\u{E76C}' }, rc.x, rc.y, rc.w, rc.h, C::Dim, true),
+                FB_REPL1 | FB_REPLALL | FB_SEARCH => {
+                    if !hovered {
+                        g.stroke_round(rc.x, rc.y, rc.w, rc.h, 4.0, C::Border, 1.0);
+                    }
+                    let label = match *id {
+                        FB_REPL1 => "Replace",
+                        FB_REPLALL => "All",
+                        _ => "Search",
+                    };
+                    let w = g.measure(label, small);
+                    g.text(label, small, rc.x + (rc.w - w) / 2.0, rc.y, rc.w, rc.h, C::Fg);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn paint_palette(&self) {
+        let Some((pr, rows)) = self.palette_rect() else { return };
+        let p = self.palette.as_ref().unwrap();
+        let g = &self.gfx;
+        self.panel(&pr);
+        g.icon('\u{E721}', pr.x + 6.0, pr.y + 6.0, 28.0, PAL_INPUT - 12.0, C::Dim, true);
+        let inp = r(pr.x + 34.0, pr.y + 6.0, pr.w - 42.0, PAL_INPUT - 12.0);
+        let ph = if p.title.is_empty() { "Type a command…".to_string() } else { p.title.clone() };
+        self.draw_input(&p.input, &inp, true, &ph, 0.0);
+        let ui = g.ui.as_ref().unwrap();
+        let small = g.ui_small.as_ref().unwrap();
+        if p.mode == PalMode::Goto {
+            g.text(&p.title, small, pr.x + 16.0, pr.y + PAL_INPUT + 5.0, pr.w - 32.0, PAL_ROW, C::Dim);
+            return;
+        }
+        for k in 0..rows {
+            let i = p.scroll + k;
+            let Some(&item) = p.shown.get(i) else { break };
+            let it = &p.items[item];
+            let y = pr.y + PAL_INPUT + 5.0 + k as f32 * PAL_ROW;
+            if i == p.sel {
+                g.fill_round(pr.x + 6.0, y, pr.w - 12.0, PAL_ROW, 5.0, C::SelDim);
+                g.fill_round(pr.x + 6.0, y + 7.0, 3.0, PAL_ROW - 14.0, 1.5, C::Accent);
+            } else if self.hover == Hit::PalRow(k) {
+                g.fill_round(pr.x + 6.0, y, pr.w - 12.0, PAL_ROW, 5.0, C::Hover);
+            }
+            let hw = if it.hint.is_empty() { 0.0 } else { (g.measure(&it.hint, small) + 8.0).min(pr.w * 0.45) };
+            g.text(&it.label, ui, pr.x + 18.0, y, pr.w - 36.0 - hw, PAL_ROW, C::Fg);
+            if !it.hint.is_empty() {
+                let f = small;
+                unsafe {
+                    let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                }
+                g.text(&it.hint, f, pr.x + pr.w - 16.0 - hw, y, hw, PAL_ROW, C::Dim);
+                unsafe {
+                    let _ = f.SetTextAlignment(Default::default());
+                }
+            }
+        }
+        if p.shown.is_empty() {
+            g.text("No matching commands", small, pr.x + 18.0, pr.y + PAL_INPUT, pr.w - 36.0, PAL_ROW, C::Faint);
+        }
+        let _ = rect;
+    }
+}

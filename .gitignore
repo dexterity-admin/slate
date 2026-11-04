@@ -1,0 +1,5 @@
+﻿target/
+tmp/
+shots/
+target-dbg/
+dist/

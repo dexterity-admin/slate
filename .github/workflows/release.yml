@@ -1,0 +1,80 @@
+name: Release
+
+# Push an annotated tag vX.Y.Z whose version matches Cargo.toml. The tag
+# message becomes the release notes shown inside Slate's updater.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $cargo) { throw "Tag v$tag does not match Cargo.toml version $cargo" }
+          "VERSION=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Release notes from the tag message
+        shell: pwsh
+        run: |
+          git fetch --force --tags
+          $notes = git for-each-ref "refs/tags/${{ github.ref_name }}" --format='%(contents)'
+          if (-not $notes.Trim()) { $notes = "Slate $env:VERSION" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Set-Content dist/NOTES.md $notes -Encoding utf8
+          Copy-Item target/release/slate.exe dist/slate.exe
+
+      - name: Signed update manifest
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if (-not $env:UPDATE_SIGNING_KEY) { throw "UPDATE_SIGNING_KEY secret is missing" }
+          python -m pip install --quiet cryptography
+          python tools/make_manifest.py dist $env:VERSION dist/NOTES.md
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $iscc = Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress | Out-Null
+            $iscc = Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc.Source "/DAppVersion=$env:VERSION" installer/slate.iss
+          if ($LASTEXITCODE) { throw "ISCC failed" }
+
+      - name: Portable zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/slate.exe, README.md -DestinationPath "dist/Slate-$env:VERSION-portable.zip"
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/Slate-Setup-$env:VERSION.exe" "dist/Slate-$env:VERSION-portable.zip" `
+            dist/slate.exe dist/update.json dist/update.json.sig `
+            --title "Slate $env:VERSION" --notes-file dist/NOTES.md
