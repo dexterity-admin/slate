@@ -62,6 +62,34 @@ Python, PowerShell, Batch, Shell, SQL, JSON, XML/HTML, CSS, INI/TOML, YAML, Mark
 Visual Basic, plain text); encodings UTF-8, UTF-8 BOM, UTF-16 LE/BE and ANSI with detection,
 convert-on-save and reopen-with-encoding; line endings CRLF/LF/CR, preserved on save.
 
+## CSV grid
+
+`.csv`, `.tsv` and `.tab` files open as a table (Ctrl+Shift+G switches between grid and text; the
+status bar shows which, and the delimiter). The delimiter (comma, tab, semicolon or pipe) is
+detected and can be changed. Quoted fields, commas inside quotes, line breaks inside a cell, and
+inch marks such as `6" PIPE` are all read correctly.
+
+- **Filter** – a box under each column header. Text matches anywhere in the cell, ignoring case;
+  `=A1A` matches the whole value, `!vent` excludes, `>100`, `<=6.5` compare numbers. Filters
+  combine. Ctrl+F types into the current column's filter; the × at the left clears them all.
+- **Sort** – the arrow at the right of a header: ascending, descending, off. Numbers sort as
+  numbers, blanks stay last. Sorting and filtering only change the view, never the file.
+- **Select** – click and drag cells, click a header for whole columns or a row number for whole
+  rows, Shift to extend, Ctrl+A for everything. Arrows, Tab, Enter, Page Up/Down, Ctrl+arrows and
+  Ctrl+Home/End move as in a spreadsheet.
+- **Copy to Excel** – Ctrl+C puts the cells on the clipboard as tab-separated text plus Excel's own
+  format, so they paste as **separate columns**. Values stay exactly as in the file: `0012` stays
+  `0012`, `1-2` does not become a date, numbers stay numbers. Whole-column copies include the
+  header. Copying CSV text from the *text* view pastes into Excel as columns too, while other
+  editors still receive the original comma-separated text.
+- **Edit** – type over a cell, or F2 / double-click to edit it; Enter or Tab commits, Esc cancels.
+  Delete clears the selection; Ctrl+V pastes from Excel (one value pasted over a block fills it,
+  rows past the end are added). Only the changed records are rewritten, untouched fields keep their
+  exact bytes, and every edit is one undo step.
+- **Columns** – drag a header edge to resize, double-click it to fit.
+- Large files: a 66 MB, 1,000,000-row file opens in the grid in about a second, filters in about
+  half a second and adds roughly 12 MB of memory over the file itself.
+
 Everything is reachable from the **command palette** (Ctrl+Shift+P, F1 or the ≡ button), which
 also lists each shortcut. Status-bar items are clickable (line → go to line, encoding, line
 ending, language, tab width, zoom, wrap).
@@ -94,6 +122,7 @@ ending, language, tab width, zoom, wrap).
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom in / out / reset |
 | F8 | Focus other view |
 | Ctrl+Shift+R / Ctrl+Shift+M | Record / play macro |
+| Ctrl+Shift+G | CSV grid / text view |
 | Insert | Overtype |
 
 ## Command line
@@ -113,7 +142,9 @@ slate.exe [files...] [-multiInst] [-nosession]
   shows "(mixed)" and a message says so on open.
 - Folding follows indentation (plus Allman `{` lines), not a full parser.
 - Not included, by agreement: Notepad++ plugins, function list, document map, compare,
-  printing, auto-update, localization.
+  printing, localization.
+- The grid cannot add rows to an empty table or insert columns; use the text view (or paste rows
+  past the end).
 - Context menus, file dialogs and message boxes are the native Windows ones.
 - Files up to 4 GB.
 
@@ -128,7 +159,8 @@ cargo test --release
 ```
 
 Source layout: `doc.rs` gap buffer + line index · `buffer.rs` selections, undo, folds, bookmarks ·
-`edit.rs` text commands · `syntax.rs` lexers · `enc.rs` encodings · `search.rs` find / find in
+`edit.rs` text commands · `csv.rs` table index, filters, sort, Excel clipboard formats ·
+`grid.rs` the grid view · `syntax.rs` lexers · `enc.rs` encodings · `search.rs` find / find in
 files · `app.rs` tabs, views, commands, session · `view.rs` layout cache and scrolling ·
 `paint.rs` rendering · `input.rs` keyboard and mouse · `ui.rs` chrome geometry · `gfx.rs`
 Direct2D resources · `sys.rs` clipboard, dialogs · `main.rs` window and message loop.

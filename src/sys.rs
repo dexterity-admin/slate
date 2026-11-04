@@ -29,7 +29,15 @@ fn column_format() -> u32 {
 
 /// Puts UTF-8 `text` on the clipboard; `column` marks a rectangular copy.
 pub fn set_clipboard(hwnd: HWND, text: &[u8], column: bool) {
-    let s: Vec<u16> = String::from_utf8_lossy(text).replace('\n', "\r\n").encode_utf16().chain([0]).collect();
+    let s = String::from_utf8_lossy(text).replace('\n', "\r\n");
+    let extra: &[(&str, Vec<u8>)] = if column { &[("MSDEVColumnSelect", Vec::new())] } else { &[] };
+    set_clipboard_with(hwnd, &s, extra);
+}
+
+/// Puts `text` (line ends as given) and extra registered formats, each a
+/// NUL-terminated byte string, such as "HTML Format" or "XML Spreadsheet".
+pub fn set_clipboard_with(hwnd: HWND, text: &str, extra: &[(&str, Vec<u8>)]) {
+    let s: Vec<u16> = text.encode_utf16().chain([0]).collect();
     unsafe {
         if OpenClipboard(hwnd).is_err() {
             return;
@@ -43,13 +51,38 @@ pub fn set_clipboard(hwnd: HWND, text: &[u8], column: bool) {
                 let _ = SetClipboardData(CF_UNICODETEXT, HANDLE(h.0));
             }
         }
-        if column {
-            if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, 1) {
-                let _ = SetClipboardData(column_format(), HANDLE(h.0));
+        for (name, data) in extra {
+            let fmt = if *name == "MSDEVColumnSelect" { column_format() } else { RegisterClipboardFormatW(PCWSTR(wide(name).as_ptr())) };
+            if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, data.len() + 1) {
+                let p = GlobalLock(h) as *mut u8;
+                if !p.is_null() {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+                    *p.add(data.len()) = 0;
+                    let _ = GlobalUnlock(h);
+                    let _ = SetClipboardData(fmt, HANDLE(h.0));
+                }
             }
         }
         let _ = CloseClipboard();
     }
+}
+
+/// Copies table cells: tab-separated text plus the HTML and Excel formats,
+/// so a spreadsheet pastes them as separate columns with values intact.
+pub fn set_clipboard_table(hwnd: HWND, rows: &[Vec<String>]) {
+    set_clipboard_with(hwnd, &crate::csv::to_tsv(rows), &table_formats(rows));
+}
+
+/// The spreadsheet formats for `rows` (none when the copy is very large).
+pub fn table_formats(rows: &[Vec<String>]) -> Vec<(&'static str, Vec<u8>)> {
+    let mut extra = Vec::new();
+    if let Some(x) = crate::csv::to_xml_spreadsheet(rows) {
+        extra.push(("XML Spreadsheet", x.into_bytes()));
+    }
+    if let Some(h) = crate::csv::to_html(rows) {
+        extra.push(("HTML Format", h.into_bytes()));
+    }
+    extra
 }
 
 /// Clipboard text as UTF-8 with `\n` line ends, and whether it was a column copy.

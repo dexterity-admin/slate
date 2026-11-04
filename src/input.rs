@@ -87,6 +87,7 @@ fn key_cmd(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<Cmd> {
         (true, true, false, v) if v == k('R') => Cmd::MacroRecord,
         (true, true, false, v) if v == k('M') => Cmd::MacroPlay,
         (false, false, false, VK_INSERT) => Cmd::Overtype,
+        (true, true, false, v) if v == k('G') => Cmd::Grid,
         _ => return None,
     })
 }
@@ -102,6 +103,9 @@ impl App {
             return self.palette_key(vk, ctrl, shift);
         }
         if self.in_find && self.find.is_some() && self.find_key(vk, ctrl, shift, alt) {
+            return true;
+        }
+        if self.grid_active() && self.grid_key(vk, ctrl, shift, alt) {
             return true;
         }
         if let Some(c) = key_cmd(vk, ctrl, shift, alt) {
@@ -260,6 +264,10 @@ impl App {
         if self.cur_ref().loading.is_some() {
             return;
         }
+        if self.grid_active() {
+            self.grid_char(ch);
+            return;
+        }
         self.record(Action::Char(ch));
         let mut s = [0u8; 4];
         let bytes = ch.encode_utf8(&mut s).as_bytes().to_vec();
@@ -402,9 +410,13 @@ impl App {
         if self.palette.is_some() && !matches!(hit, Hit::PalRow(_) | Hit::PalInput | Hit::Overlay) {
             self.palette = None;
         }
+        if !matches!(hit, Hit::Grid(_)) {
+            self.grid_commit();
+        }
         self.pressed = hit;
         match hit {
             Hit::Menu => self.command_palette(),
+            Hit::Grid(v) => self.grid_mouse_down(v, x, y, shift),
             Hit::Tab(v, i) => {
                 self.views[v].active = i;
                 self.av = v;
@@ -523,7 +535,7 @@ impl App {
         }
     }
 
-    fn capture(&self) {
+    pub fn capture(&self) {
         unsafe {
             SetCapture(self.hwnd);
         }
@@ -538,6 +550,13 @@ impl App {
             if repaint {
                 self.redraw();
             }
+        }
+        match hit {
+            Hit::Grid(v) if matches!(self.drag, Drag::None) => self.grid_hover_at(v, x, y),
+            _ => self.grid_hover = crate::grid::GHit::None,
+        }
+        if self.grid_drag(x, y) {
+            return;
         }
         match self.drag {
             Drag::Select { view, anchor, column, unit, origin } => {
@@ -612,7 +631,7 @@ impl App {
                     self.redraw();
                 }
             }
-            Drag::None => {}
+            _ => {}
         }
     }
 
@@ -712,6 +731,9 @@ impl App {
         if self.views[v].tabs.is_empty() {
             return;
         }
+        if self.buf_of(v).grid.is_some() && self.buf_of(v).loading.is_none() {
+            return self.grid_wheel(v, if horizontal { delta } else { delta * if shift { -1 } else { 1 } }, shift || horizontal);
+        }
         if shift || horizontal {
             let d = if horizontal { delta } else { -delta };
             self.scroll_x(v, d as f32 / 120.0 * self.gfx.char_w * 8.0);
@@ -729,6 +751,7 @@ impl App {
             let _ = ClientToScreen(self.hwnd, &mut pt);
         }
         match hit {
+            Hit::Grid(v) => self.grid_context(v, x, y, pt),
             Hit::Tab(v, i) => {
                 self.views[v].active = i;
                 self.av = v;
@@ -822,6 +845,8 @@ impl App {
             7 => Cmd::Overtype,
             8 => Cmd::MacroRecord,
             9 => Cmd::InstallUpdate,
+            10 => Cmd::Grid,
+            11 => Cmd::GridDelim,
             _ => return,
         };
         self.exec(c);

@@ -50,6 +50,7 @@ pub enum Cmd {
     ZoomReset, Wrap, Whitespace, Theme, MoveOther, CloneOther, FocusOther, CloseSplit, MacroRecord,
     MacroPlay, Language, Encoding, ReopenEncoding, LineEnding, TabSize, UseTabs, Overtype, NextTab,
     PrevTab, ToggleSession, About, CheckUpdates, InstallUpdate, AutoUpdate, Accent, Animations,
+    Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
 }
 
 pub static COMMANDS: &[(Cmd, &str, &str)] = &[
@@ -125,6 +126,13 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::CloseSplit, "View: Close Split", ""),
     (Cmd::NextTab, "View: Next Tab", "Ctrl+Tab"),
     (Cmd::PrevTab, "View: Previous Tab", "Ctrl+Shift+Tab"),
+    (Cmd::Grid, "View: Toggle CSV Grid / Text", "Ctrl+Shift+G"),
+    (Cmd::GridHeader, "Grid: Toggle First Row as Header", ""),
+    (Cmd::GridDelim, "Grid: Set Column Delimiter…", ""),
+    (Cmd::GridClear, "Grid: Clear Filters and Sort", ""),
+    (Cmd::GridFit, "Grid: Autofit Column Widths", ""),
+    (Cmd::GridCopyHeaders, "Grid: Copy with Headers", ""),
+    (Cmd::GridDefault, "Settings: Toggle Opening CSV Files as a Grid", ""),
     (Cmd::Language, "Document: Set Language…", ""),
     (Cmd::Encoding, "Document: Convert Encoding…", ""),
     (Cmd::ReopenEncoding, "Document: Reopen with Encoding…", ""),
@@ -235,6 +243,7 @@ pub enum PalAct {
     Eol(Eol),
     TabSize(usize),
     Accent(usize),
+    Delim(u8),
 }
 
 pub struct PalItem {
@@ -341,6 +350,7 @@ pub enum Hit {
     PalRow(usize),
     PalInput,
     Overlay,
+    Grid(usize),
 }
 
 pub enum Drag {
@@ -349,6 +359,11 @@ pub enum Drag {
     Scroll { view: usize, grab: f32 },
     Splitter,
     Tab { view: usize, idx: usize, x0: f32, moved: bool },
+    /// Cell selection; mode 0 cells, 1 whole rows, 2 whole columns.
+    Grid { view: usize, mode: u8 },
+    GridCol { view: usize, col: usize, x0: f32, w0: f32 },
+    GridV { view: usize, grab: f32 },
+    GridH { view: usize, grab: f32 },
 }
 
 #[derive(Clone)]
@@ -414,6 +429,8 @@ pub struct App {
     pub anim_timer: bool,
     /// The new version took over; close without saving the session again.
     pub exiting_for_update: bool,
+    /// Grid part under the mouse that shows a hover state.
+    pub grid_hover: crate::grid::GHit,
 }
 
 pub fn invalidate(hwnd: HWND) {
@@ -473,6 +490,7 @@ impl App {
             find_since: None,
             anim_timer: false,
             exiting_for_update: false,
+            grid_hover: crate::grid::GHit::None,
         }
     }
 
@@ -601,6 +619,7 @@ impl App {
         if d.mixed_eol {
             self.flash(&format!("{}: mixed line endings unified to {} (applies on save)", pb.display(), d.eol.name()));
         }
+        self.auto_grid(id);
         self.after_switch();
         true
     }
@@ -665,6 +684,7 @@ impl App {
                     if mixed {
                         self.flash(&format!("{name}: mixed line endings unified to {} (applies on save)", eol.name()));
                     }
+                    self.auto_grid(l.id);
                 }
                 Err(e) => {
                     let name = self.bufs[i].name();
@@ -940,6 +960,11 @@ impl App {
                     }
                     out += &format!("anchor={}\ncaret={}\ntop={}\n", p.anchor, p.head, t.top);
                     out += &format!("lang={}\nenc={}\neol={}\n", LANGS[b.lang].name, b.enc.name(), b.eol.name());
+                    if b.grid.is_some() {
+                        out += "grid=1\n";
+                    } else if b.path.as_deref().map_or(false, crate::csv::is_table_path) {
+                        out += "grid=0\n";
+                    }
                     if !b.bookmarks.is_empty() {
                         out += &format!("bookmarks={}\n", b.bookmarks.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
                     }
@@ -1038,6 +1063,11 @@ impl App {
                 b.bookmarks = bm.split(',').filter_map(|x| x.parse().ok()).filter(|&x: &usize| x < lines).collect();
             }
             let top = t.get("top").and_then(|x| x.parse().ok()).unwrap_or(0usize).min(b.doc.line_count() - 1);
+            match t.get("grid").map(|s| s.as_str()) {
+                Some("1") => self.enable_grid(i),
+                Some(_) => {}
+                None => self.auto_grid(id),
+            }
             self.views[v].tabs.push(Tab { buf: id, top, sub: 0, x: 0.0 });
             if t.get("active").map(|x| x == "1").unwrap_or(false) {
                 actives[v] = Some(self.views[v].tabs.len() - 1);
@@ -1097,6 +1127,7 @@ impl App {
         let Some(p) = self.bufs[i].path.clone() else { return };
         let Ok(raw) = crate::doc::read_for_doc(&p) else { return };
         let d = enc::decode(raw, force);
+        let grid = self.bufs[i].grid.take();
         let old = &self.bufs[i];
         let caret = old.caret();
         let mut nb = Buffer::new(id, d.text);
@@ -1112,6 +1143,12 @@ impl App {
         let lines = nb.doc.line_count();
         nb.bookmarks.retain(|&l| l < lines);
         nb.set_caret(caret);
+        // The grid keeps its filters, sort and widths over the new text.
+        if let Some(mut g) = grid {
+            g.edit = None;
+            g.reindex(&mut nb.doc, nb.gen);
+            nb.grid = Some(g);
+        }
         self.bufs[i] = nb;
         self.after_switch();
     }
@@ -1454,6 +1491,7 @@ impl App {
                 let _ = self.gfx.make_brushes();
                 self.cache.clear();
             }
+            PalAct::Delim(d) => self.grid_set_delim(d),
             PalAct::TabSize(n) => {
                 settings::get_mut().tab_size = n;
                 for b in self.bufs.iter_mut() {
@@ -1508,7 +1546,72 @@ impl App {
             self.flash("Still loading this file…");
             return;
         }
+        let grid_cmd = matches!(c, Cmd::GridHeader | Cmd::GridDelim | Cmd::GridClear | Cmd::GridFit | Cmd::GridCopyHeaders);
+        if self.grid_active() {
+            self.grid_commit();
+            match c {
+                Cmd::Copy => return self.grid_copy(false),
+                Cmd::GridCopyHeaders => return self.grid_copy(true),
+                Cmd::Cut => {
+                    self.grid_copy(false);
+                    self.grid_clear(self.av);
+                    return;
+                }
+                Cmd::Paste => return self.grid_paste(),
+                Cmd::SelectAll => {
+                    self.grid_select_all(self.av);
+                    return self.redraw();
+                }
+                Cmd::Find | Cmd::Replace => {
+                    self.grid_focus_filter();
+                    return self.redraw();
+                }
+                // Commands that move or edit the text caret have no meaning here.
+                _ if !(safe_while_loading
+                    || grid_cmd
+                    || matches!(c, Cmd::Grid | Cmd::GridDefault | Cmd::Save | Cmd::SaveAs | Cmd::Reload | Cmd::Undo | Cmd::Redo
+                        | Cmd::Language | Cmd::Encoding | Cmd::ReopenEncoding | Cmd::LineEnding)) =>
+                {
+                    self.flash("Not available in the grid \u{2013} Ctrl+Shift+G switches to the text view");
+                    return;
+                }
+                _ => {}
+            }
+        } else if grid_cmd {
+            self.flash("Open the grid first \u{2013} Ctrl+Shift+G");
+            return;
+        }
         match c {
+            Cmd::Grid => {
+                self.toggle_grid();
+                changed = false;
+            }
+            Cmd::GridHeader => {
+                self.grid_toggle_header();
+                changed = false;
+            }
+            Cmd::GridDelim => {
+                self.grid_delim_palette();
+                changed = false;
+            }
+            Cmd::GridClear => {
+                self.grid_clear_filters();
+                changed = false;
+            }
+            Cmd::GridFit => {
+                self.grid_fit_all();
+                changed = false;
+            }
+            Cmd::GridCopyHeaders => changed = false,
+            Cmd::GridDefault => {
+                let on = {
+                    let mut s = settings::get_mut();
+                    s.csv_grid = !s.csv_grid;
+                    s.csv_grid
+                };
+                self.flash(if on { "CSV files open as a grid" } else { "CSV files open as text" });
+                changed = false;
+            }
             Cmd::New => self.new_file(),
             Cmd::Open => self.open_dialog(),
             Cmd::Save => {
@@ -1600,7 +1703,14 @@ impl App {
                     t = b.doc.text(b.doc.line_start(l), b.doc.line_end(l));
                     t.push(b'\n');
                 }
-                sys::set_clipboard(hwnd, &t, column);
+                if !column && b.path.as_deref().map_or(false, crate::csv::is_table_path) {
+                    // CSV text keeps its commas for editors; spreadsheets get columns.
+                    let d = crate::csv::sniff(&b.doc.text(0, b.doc.len().min(1 << 16)));
+                    let rows = crate::csv::parse_rows(&t, d);
+                    sys::set_clipboard_with(hwnd, &String::from_utf8_lossy(&t).replace('\n', "\r\n"), &sys::table_formats(&rows));
+                } else {
+                    sys::set_clipboard(hwnd, &t, column);
+                }
                 if c == Cmd::Cut {
                     let b = self.cur();
                     if whole_line {

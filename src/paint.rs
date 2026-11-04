@@ -253,6 +253,10 @@ impl App {
             g.fill_round(x, y, (w * frac).max(6.0), 6.0, 3.0, C::Accent);
             return;
         }
+        if self.buf_of(v).grid.is_some() {
+            self.paint_grid(v);
+            return;
+        }
         let (vx, _, vw, _) = self.view_rect(v);
         let (tx, ty, tw, th) = self.text_rect(v);
         let rows = self.rows(v);
@@ -458,6 +462,7 @@ impl App {
     fn paint_status(&mut self) {
         let y = self.h - STATUS_H;
         let mut segs: Vec<(String, u8)> = Vec::new();
+        let grid = self.grid_active().then(|| self.grid_status());
         {
             let b = self.cur_ref();
             let p = b.caret();
@@ -469,6 +474,9 @@ impl App {
                 pos += &format!("  ({} carets)", b.sels.len());
             } else if selected > 0 {
                 pos += &format!("  ({selected} selected)");
+            }
+            if let Some((_, gp)) = &grid {
+                pos = gp.clone();
             }
             let s = settings::get();
             if let Some(m) = &self.upd.available {
@@ -487,8 +495,17 @@ impl App {
                 let pct = ((s.font_size + s.zoom as f32) / s.font_size * 100.0).round();
                 segs.push((format!("{pct}%"), 5));
             }
+            // Grid / text switch for table files, and the delimiter in the grid.
+            if let Some(g) = &b.grid {
+                segs.push(("Grid".into(), 10));
+                segs.push((crate::csv::delim_name(g.delim).into(), 11));
+            } else if b.path.as_deref().map_or(false, crate::csv::is_table_path) {
+                segs.push(("Text".into(), 10));
+            }
             segs.push((pos, 0));
-            segs.push((format!("{}: {}", if s.use_tabs { "Tabs" } else { "Spaces" }, s.tab_size), 1));
+            if grid.is_none() {
+                segs.push((format!("{}: {}", if s.use_tabs { "Tabs" } else { "Spaces" }, s.tab_size), 1));
+            }
             segs.push((b.enc.name().to_string(), 2));
             segs.push((format!("{}{}", b.eol.name(), if b.mixed_eol { " (mixed)" } else { "" }), 3));
             segs.push((LANGS[b.lang].name.to_string(), 4));
@@ -518,9 +535,10 @@ impl App {
             g.text(text, small, x + 9.0 + icon_w, y, w, STATUS_H, c);
             hits.push((x, x + w, *id));
         }
-        let left = match &self.status {
-            Some(s) => s.clone(),
-            None => {
+        let left = match (&self.status, grid) {
+            (Some(s), _) => s.clone(),
+            (None, Some((summary, _))) => summary,
+            (None, None) => {
                 let b = self.cur_ref();
                 let n = b.doc.line_count();
                 format!("{} lines  \u{B7}  {} bytes", n, b.doc.len())
@@ -530,7 +548,7 @@ impl App {
         self.status_segs = hits;
     }
 
-    fn draw_input(&self, inp: &Input, rc: &Rect, focused: bool, placeholder: &str, right_pad: f32) {
+    pub(crate) fn draw_input(&self, inp: &Input, rc: &Rect, focused: bool, placeholder: &str, right_pad: f32) {
         let g = &self.gfx;
         g.fill_round(rc.x, rc.y, rc.w, rc.h, 5.0, C::Bg);
         g.stroke_round(rc.x, rc.y, rc.w, rc.h, 5.0, if focused { C::Accent } else { C::Border }, 1.0);

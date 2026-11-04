@@ -256,6 +256,9 @@ impl App {
             }
             return Hit::TabStrip(v);
         }
+        if self.buf_of(v).grid.is_some() && self.buf_of(v).loading.is_none() {
+            return Hit::Grid(v);
+        }
         if x >= vx + vw - SCROLL_W {
             return Hit::VScroll(v);
         }

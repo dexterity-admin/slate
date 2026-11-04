@@ -3,7 +3,9 @@
 mod anim;
 mod app;
 mod buffer;
+mod csv;
 mod doc;
+mod grid;
 mod edit;
 mod enc;
 mod gfx;
@@ -250,6 +252,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let id = match hit {
                     Hit::Text(_) | Hit::FindField(_) | Hit::PalInput => IDC_IBEAM,
                     Hit::Splitter => IDC_SIZEWE,
+                    Hit::Grid(v) => match a.grid_hit(v, pt.x as f32 / a.scale, pt.y as f32 / a.scale) {
+                        grid::GHit::Edge(_) => IDC_SIZEWE,
+                        grid::GHit::Filter(_) => IDC_IBEAM,
+                        _ => IDC_ARROW,
+                    },
                     _ => IDC_ARROW,
                 };
                 if let Ok(c) = LoadCursorW(None, id) {
@@ -265,6 +272,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             T_BACKUP => a.write_backups(),
             app::T_LOAD | app::T_ANIM => a.redraw(),
+            grid::T_FILTER => a.on_filter_timer(),
             updater_ui::T_UPDATE => a.on_update_timer(),
             updater_ui::T_HANDSHAKE => a.on_handshake_timer(),
             updater_ui::T_CLEANUP => a.on_cleanup_timer(),

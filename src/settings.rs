@@ -17,6 +17,8 @@ pub struct Settings {
     /// Index into gfx::ACCENTS.
     pub accent: usize,
     pub animate: bool,
+    /// Open .csv / .tsv files in the grid.
+    pub csv_grid: bool,
     /// Release the user chose to skip.
     pub skip_version: String,
     pub recent: Vec<String>,
@@ -36,6 +38,7 @@ static S: RwLock<Settings> = RwLock::new(Settings {
     auto_update: true,
     accent: 0,
     animate: true,
+    csv_grid: true,
     skip_version: String::new(),
     recent: Vec::new(),
     win: None,
@@ -87,6 +90,7 @@ pub fn load() {
             "auto_update" => s.auto_update = v != "0",
             "accent" => s.accent = v.parse().unwrap_or(0usize).min(crate::gfx::ACCENTS.len() - 1),
             "animate" => s.animate = v != "0",
+            "csv_grid" => s.csv_grid = v != "0",
             "skip_version" => s.skip_version = v.into(),
             "recent" if !v.is_empty() => s.recent.push(v.into()),
             "window" => {
@@ -109,7 +113,7 @@ pub fn save() {
     out += &format!("wrap={}\ntab_size={}\nuse_tabs={}\n", b(s.wrap), s.tab_size, b(s.use_tabs));
     out += &format!("show_ws={}\nrestore_session={}\n", b(s.show_ws), b(s.restore_session));
     out += &format!("auto_update={}\nskip_version={}\n", b(s.auto_update), s.skip_version);
-    out += &format!("accent={}\nanimate={}\n", s.accent, b(s.animate));
+    out += &format!("accent={}\nanimate={}\ncsv_grid={}\n", s.accent, b(s.animate), b(s.csv_grid));
     if let Some((x, y, w, h, m)) = s.win {
         out += &format!("window={x},{y},{w},{h},{}\n", m as i32);
     }
