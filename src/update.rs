@@ -295,28 +295,39 @@ pub fn old_path(exe: &Path) -> PathBuf {
 /// Swaps `new_exe` into the place of the running exe. On error nothing changes.
 pub fn swap_in(new_exe: &Path) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let old = old_path(&exe);
+    swap_in_at(&exe, new_exe)?;
+    Ok(exe)
+}
+
+/// Moves `exe` aside to `<exe>.old` (a running image may be renamed, not
+/// overwritten) and copies `new_exe` into its place.
+pub fn swap_in_at(exe: &Path, new_exe: &Path) -> Result<(), String> {
+    let old = old_path(exe);
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| format!("Slate's folder is not writable ({e}). Download the new version from the releases page instead."))?;
-    if let Err(e) = std::fs::copy(new_exe, &exe) {
-        let _ = std::fs::remove_file(&exe);
-        let _ = std::fs::rename(&old, &exe);
+    std::fs::rename(exe, &old).map_err(|e| format!("Slate's folder is not writable ({e}). Download the new version from the releases page instead."))?;
+    if let Err(e) = std::fs::copy(new_exe, exe) {
+        let _ = std::fs::remove_file(exe);
+        let _ = std::fs::rename(&old, exe);
         return Err(format!("could not place the new version: {e}"));
     }
-    Ok(exe)
+    Ok(())
 }
 
 /// Puts the previous exe back after a failed start.
 pub fn roll_back() -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
-    // current_exe() still names the original path for the renamed image.
-    let target = if exe.extension().map(|e| e == "old").unwrap_or(false) { exe.with_extension("") } else { exe.clone() };
-    let old = old_path(&target);
+    // current_exe() may report either name for the renamed image.
+    let target = if exe.extension().map(|e| e == "old").unwrap_or(false) { exe.with_extension("") } else { exe };
+    roll_back_at(&target)
+}
+
+pub fn roll_back_at(exe: &Path) -> bool {
+    let old = old_path(exe);
     if !old.exists() {
         return false;
     }
-    let _ = std::fs::remove_file(&target);
-    std::fs::rename(&old, &target).is_ok()
+    let _ = std::fs::remove_file(exe);
+    std::fs::rename(&old, exe).is_ok()
 }
 
 /// Removes leftovers from a finished update (best effort; retried each start).
@@ -380,6 +391,27 @@ mod tests {
         tampered[10] ^= 1;
         assert!(!verify(&tampered, &sig, &PUBLIC_KEY));
         assert!(parse_manifest(&String::from_utf8_lossy(&manifest)).is_some());
+    }
+
+    #[test]
+    fn swap_and_roll_back() {
+        let dir = std::env::temp_dir().join(format!("slate-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("slate.exe");
+        let new = dir.join("staged.exe");
+        std::fs::write(&exe, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+        swap_in_at(&exe, &new).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(old_path(&exe)).unwrap(), b"OLD");
+        assert!(roll_back_at(&exe));
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
+        assert!(!old_path(&exe).exists());
+        assert!(!roll_back_at(&exe));
+        // A missing staged file leaves the original in place.
+        assert!(swap_in_at(&exe, &dir.join("missing.exe")).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
