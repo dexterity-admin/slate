@@ -26,14 +26,16 @@ impl App {
     pub fn view_rect(&self, v: usize) -> (f32, f32, f32, f32) {
         let y = TITLE_H;
         let h = (self.h - TITLE_H - STATUS_H).max(0.0);
+        // The AI panel, when open, takes the right side.
+        let w = self.ai_rect().map_or(self.w, |p| p.x);
         if !self.split {
-            return (0.0, y, self.w, h);
+            return (0.0, y, w, h);
         }
-        let sx = (self.w * self.split_frac).round();
+        let sx = (w * self.split_frac).round();
         if v == 0 {
             (0.0, y, sx, h)
         } else {
-            (sx + 1.0, y, self.w - sx - 1.0, h)
+            (sx + 1.0, y, w - sx - 1.0, h)
         }
     }
 

@@ -459,6 +459,31 @@ impl Gfx {
         }
     }
 
+    /// Text wrapped to `w`, drawn from (x, y) downwards.
+    pub fn text_wrapped(&self, s: &str, f: &IDWriteTextFormat, x: f32, y: f32, w: f32, c: C) {
+        let v: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            if let Ok(l) = self.dw.CreateTextLayout(&v, f, w.max(10.0), 100_000.0) {
+                let _ = l.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                // The UI formats centre text in its box; this one starts at y.
+                let _ = l.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                self.rt().DrawTextLayout(D2D_POINT_2F { x, y }, &l, self.b(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+        }
+    }
+
+    /// Width and height of `s` wrapped to at most `w`.
+    pub fn wrapped_size(&self, s: &str, f: &IDWriteTextFormat, w: f32) -> (f32, f32) {
+        let v: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let Ok(l) = self.dw.CreateTextLayout(&v, f, w.max(10.0), 100_000.0) else { return (w, 20.0) };
+            let _ = l.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            let mut m = DWRITE_TEXT_METRICS::default();
+            let _ = l.GetMetrics(&mut m);
+            (m.widthIncludingTrailingWhitespace.min(w), m.height)
+        }
+    }
+
     pub fn measure(&self, s: &str, f: &IDWriteTextFormat) -> f32 {
         let v: Vec<u16> = s.encode_utf16().collect();
         unsafe {

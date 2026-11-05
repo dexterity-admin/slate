@@ -246,6 +246,9 @@ impl App {
             }
             return Hit::Caption;
         }
+        if let Some(part) = self.ai_hit(x, y) {
+            return Hit::Ai(part);
+        }
         if y >= self.h - STATUS_H {
             for (k, &(x0, x1, id)) in self.status_segs.iter().enumerate() {
                 let _ = k;

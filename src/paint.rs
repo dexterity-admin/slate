@@ -38,6 +38,7 @@ impl App {
             let sx = self.view_rect(1).0 - 1.0;
             self.gfx.fill(sx, TITLE_H, 1.0, self.h - TITLE_H - STATUS_H, C::Border);
         }
+        self.paint_ai();
         self.paint_title();
         self.paint_status();
         self.paint_find();

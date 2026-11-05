@@ -76,7 +76,7 @@ pub enum Cmd {
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
     Compare, CompareFile, CompareSaved, CompareNext, ComparePrev, CompareRefresh, CompareSwap,
     CompareWs, CompareCase, CompareClose,
-    TeamPeople, TeamLock, TeamToggle, TeamName, CoEdit, TeamSearch, Follow,
+    TeamPeople, TeamLock, TeamToggle, TeamName, CoEdit, TeamSearch, Follow, Ai, AiServer, AiModel, AiKey,
     LibSnippet, LibSaveSnippet, LibMacro, LibSaveMacro, LibPreset, LibSavePreset, LibFolder, LibDelete,
 }
 
@@ -155,6 +155,10 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::PrevTab, "View: Previous Tab", "Ctrl+Shift+Tab"),
     (Cmd::Grid, "View: Toggle CSV Grid / Text", "Ctrl+Shift+G"),
     (Cmd::Follow, "View: Follow File as It Grows (Tail)", "Ctrl+Shift+W"),
+    (Cmd::Ai, "View: AI Assistant Panel", "Ctrl+Shift+A"),
+    (Cmd::AiServer, "AI: Set Company AI Server\u{2026}", ""),
+    (Cmd::AiModel, "AI: Set Model Name\u{2026}", ""),
+    (Cmd::AiKey, "AI: Set Access Key\u{2026}", ""),
     (Cmd::GridHeader, "Grid: Toggle First Row as Header", ""),
     (Cmd::GridDelim, "Grid: Set Column Delimiter…", ""),
     (Cmd::GridClear, "Grid: Clear Filters and Sort", ""),
@@ -421,6 +425,8 @@ pub enum Hit {
     Grid(usize),
     /// The online-people avatars in the title bar.
     People,
+    /// A part of the AI panel (see ai::P_*).
+    Ai(u8),
 }
 
 pub enum Drag {
@@ -511,6 +517,7 @@ pub struct App {
     pub collab_offered: HashMap<u64, u64>,
     /// The window closes once background saves are done.
     pub close_after_save: bool,
+    pub ai: crate::ai::AiPanel,
     /// The team library held on this PC.
     pub library: crate::library::Store,
     /// The instant search waiting for the hub's answer.
@@ -579,6 +586,7 @@ impl App {
             team: None,
             collab_offered: HashMap::new(),
             close_after_save: false,
+            ai: Default::default(),
             splash_since: None,
             library: crate::library::Store::load(),
             search_qid: None,
@@ -1737,7 +1745,29 @@ impl App {
                 3 => self.team_search(&text),
                 4 => self.lib_save_snippet(&text),
                 5 => self.lib_save_macro(&text),
-                _ => self.lib_save_preset(&text),
+                6 => self.lib_save_preset(&text),
+                7 | 8 | 9 => {
+                    let t = text.trim().to_string();
+                    if k == 7 && !t.is_empty() && !(t.starts_with("http://") || t.starts_with("https://")) {
+                        return self.flash("The address must start with http:// or https://, e.g. http://ai-server:11434");
+                    }
+                    {
+                        let mut s = settings::get_mut();
+                        match k {
+                            7 => s.ai_url = t.clone(),
+                            8 => s.ai_model = t.clone(),
+                            _ => s.ai_key = t.clone(),
+                        }
+                    }
+                    settings::save();
+                    self.flash(match (k, t.is_empty()) {
+                        (7, true) => "No AI server: the assistant is off again",
+                        (7, false) => "AI server set \u{2013} the assistant panel (Ctrl+Shift+A) is ready",
+                        (8, _) => "Model name saved",
+                        _ => "Access key saved",
+                    });
+                }
+                _ => {}
             }
             return self.redraw();
         }
@@ -1935,6 +1965,19 @@ impl App {
             }
             Cmd::Follow => {
                 self.follow_toggle();
+                changed = false;
+            }
+            Cmd::Ai => {
+                self.ai_toggle();
+                changed = false;
+            }
+            Cmd::AiServer | Cmd::AiModel | Cmd::AiKey => {
+                let (k, title, cur) = match c {
+                    Cmd::AiServer => (7, "Your company's AI server address, e.g. http://ai-server:11434 (empty turns the assistant off)", settings::get().ai_url.clone()),
+                    Cmd::AiModel => (8, "Model name on the AI server, e.g. llama3.1", settings::get().ai_model.clone()),
+                    _ => (9, "Access key for the AI server, if it needs one", String::new()),
+                };
+                self.open_palette(PalMode::Prompt(k), title, Vec::new(), &cur);
                 changed = false;
             }
             Cmd::TeamToggle => {

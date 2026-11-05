@@ -26,6 +26,11 @@ pub struct Settings {
     /// search). Display name others see (empty: from Windows).
     pub team: bool,
     pub team_name: String,
+    /// The company's AI server (empty: the assistant is "coming soon"),
+    /// the model to ask for, and an access key if the server needs one.
+    pub ai_url: String,
+    pub ai_model: String,
+    pub ai_key: String,
     /// Release the user chose to skip.
     pub skip_version: String,
     pub recent: Vec<String>,
@@ -49,6 +54,9 @@ static S: RwLock<Settings> = RwLock::new(Settings {
     cmp_ws: false,
     cmp_case: false,
     team: true,
+    ai_url: String::new(),
+    ai_model: String::new(),
+    ai_key: String::new(),
     team_name: String::new(),
     skip_version: String::new(),
     recent: Vec::new(),
@@ -109,6 +117,9 @@ pub fn load() {
             "cmp_ws" => s.cmp_ws = v == "1",
             "cmp_case" => s.cmp_case = v == "1",
             "team" => s.team = v != "0",
+            "ai_url" => s.ai_url = v.into(),
+            "ai_model" => s.ai_model = v.into(),
+            "ai_key" => s.ai_key = v.into(),
             "team_name" => s.team_name = v.into(),
             "skip_version" => s.skip_version = v.into(),
             "recent" if !v.is_empty() => s.recent.push(v.into()),
@@ -135,6 +146,7 @@ pub fn save() {
     out += &format!("accent={}\nanimate={}\ncsv_grid={}\n", s.accent, b(s.animate), b(s.csv_grid));
     out += &format!("cmp_ws={}\ncmp_case={}\n", b(s.cmp_ws), b(s.cmp_case));
     out += &format!("team={}\nteam_name={}\n", b(s.team), s.team_name);
+    out += &format!("ai_url={}\nai_model={}\nai_key={}\n", s.ai_url, s.ai_model, s.ai_key);
     if let Some((x, y, w, h, m)) = s.win {
         out += &format!("window={x},{y},{w},{h},{}\n", m as i32);
     }

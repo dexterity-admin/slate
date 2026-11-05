@@ -92,6 +92,7 @@ fn key_cmd(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<Cmd> {
         (true, true, false, v) if v == k('E') => Cmd::CoEdit,
         (true, true, false, v) if v == k('I') => Cmd::TeamSearch,
         (true, true, false, v) if v == k('W') => Cmd::Follow,
+        (true, true, false, v) if v == k('A') => Cmd::Ai,
         (false, false, false, 0x76) => Cmd::CompareNext,
         (false, true, false, 0x76) => Cmd::ComparePrev,
         (false, false, false, 0x74) => Cmd::CompareRefresh,
@@ -110,6 +111,9 @@ impl App {
             return self.palette_key(vk, ctrl, shift);
         }
         if self.in_find && self.find.is_some() && self.find_key(vk, ctrl, shift, alt) {
+            return true;
+        }
+        if !alt && self.ai_key(vk, ctrl, shift) {
             return true;
         }
         if self.grid_active() && self.grid_key(vk, ctrl, shift, alt) {
@@ -257,6 +261,9 @@ impl App {
             p.input.insert(&ch.to_string());
             self.filter_palette();
             self.redraw();
+            return;
+        }
+        if self.ai_char(ch) {
             return;
         }
         if self.in_find {
@@ -428,7 +435,11 @@ impl App {
             self.grid_commit();
         }
         self.pressed = hit;
+        if !matches!(hit, Hit::Ai(_)) {
+            self.ai.focus = false;
+        }
         match hit {
+            Hit::Ai(part) => self.ai_click(part),
             Hit::Menu => self.command_palette(),
             Hit::People => self.team_people(),
             Hit::Grid(v) => self.grid_mouse_down(v, x, y, shift),
@@ -725,6 +736,9 @@ impl App {
     }
 
     pub fn on_wheel(&mut self, x: f32, y: f32, delta: i32, ctrl: bool, shift: bool, horizontal: bool) {
+        if !ctrl && self.ai_wheel(x, y, delta) {
+            return;
+        }
         if ctrl {
             self.exec(if delta > 0 { Cmd::ZoomIn } else { Cmd::ZoomOut });
             return;
