@@ -63,8 +63,19 @@ modified ones ask), show in Explorer, copy path. A second `slate.exe <file>` han
 running window.
 
 **Session** – tabs, carets, scroll positions, bookmarks and *unsaved* text are restored on the next
-start. Unsaved buffers are backed up every 8 s after an edit, so a crash loses at most a few
-seconds. Stored in `%APPDATA%\Slate\` (`settings.ini`, `session.ini`, `backup\`).
+start, as in Notepad++: close Slate with unsaved edits in any number of files, new tabs that were
+never saved included, and they are all there next time. The same holds when Slate does not close
+normally:
+
+- **Windows shuts down, restarts or signs out** – Slate writes everything at once and asks
+  nothing; after an update restart Windows can start Slate again by itself.
+- **A crash or a power cut** – unsaved text is copied within 2 seconds of an edit, and the list of
+  open tabs is kept current with it, so at most the last couple of seconds of typing are lost.
+- Each copy is written in full and only then swapped in, so a power cut mid-write cannot leave a
+  damaged copy. Unsaved text that the session does not list is opened as a tab, never deleted.
+- After a crash or shutdown, the tabs come back even with session restore turned off.
+
+Stored in `%APPDATA%\Slate\` (`settings.ini`, `session.ini`, `backup\`).
 
 **Editing** – undo/redo (typing coalesced), cut/copy/paste (whole line when nothing is selected),
 multiple carets (Ctrl+click, Ctrl+E next occurrence, Ctrl+Alt+Up/Down), column selection
@@ -260,7 +271,9 @@ folders every 10 minutes and answers searches (the folders are remembered; `--on
   carry on, the half with fewer changes reloads the other's text when they meet again.
 - Instant search is literal text (no regular expressions through the index) and checks at most
   3,000 candidate files per search.
-- Unsaved changes in huge files are not backed up while you work; closing Slate asks about them.
+- Unsaved changes in files of 64 MB or more are not copied while you work (each copy would take
+  seconds): closing Slate asks about them and a Windows shutdown copies them, but a crash or power
+  cut loses them.
 - The grid cannot add rows to an empty table or insert columns; use the text view (or paste rows
   past the end).
 - Context menus, file dialogs and message boxes are the native Windows ones.
@@ -290,4 +303,6 @@ Direct2D resources · `sys.rs` clipboard, dialogs · `main.rs` window and messag
 Test tools: `tools\drive.ps1` drives a live window and takes screenshots; `tools\duo.ps1` drives two
 windows as two team members on the LAN; `tools\bigfile.ps1` times opening, searching and saving a
 big file; `tools\rollback-test.ps1` runs crash, hang and good updates through the real updater;
+`tools\recovery-test.ps1` edits 100 files, ends Slate by a crash or a Windows shutdown and checks
+that every tab and every unsaved edit comes back;
 `tools\bench.ps1` produces the table above. The website is `docs\index.html` (GitHub Pages).

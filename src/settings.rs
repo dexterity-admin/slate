@@ -86,6 +86,13 @@ pub fn dir() -> PathBuf {
     base.join("Slate")
 }
 
+/// Present while Slate runs and removed when it closes normally: found at
+/// start, it means Slate was ended by a crash, a power cut or Windows
+/// shutting down, so the last session comes back whatever the settings say.
+pub fn running_marker() -> PathBuf {
+    dir().join("running")
+}
+
 pub fn backup_dir() -> PathBuf {
     dir().join("backup")
 }
@@ -162,7 +169,7 @@ pub fn save() {
         out += &format!("recent={r}\n");
     }
     let _ = std::fs::create_dir_all(dir());
-    let _ = std::fs::write(dir().join("settings.ini"), out);
+    let _ = crate::app::write_atomic(&dir().join("settings.ini"), out.as_bytes());
 }
 
 pub fn push_recent(path: &str) {

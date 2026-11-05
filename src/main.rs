@@ -298,7 +298,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             T_BENCH => {
                 let _ = DestroyWindow(hwnd);
             }
-            T_BACKUP => a.write_backups(),
+            T_BACKUP => a.persist(),
             app::T_LOAD | app::T_ANIM => a.redraw(),
             grid::T_FILTER => a.on_filter_timer(),
             collab::T_COLLAB => a.collab_tick(),
@@ -423,8 +423,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     settings::get_mut().win = Some((r.left, r.top, r.right - r.left, r.bottom - r.top, a.maximized));
                 }
                 settings::save();
+                if !a.no_session {
+                    let _ = std::fs::remove_file(settings::running_marker());
+                }
             }
             let _ = DestroyWindow(hwnd);
+        }
+        // Windows is shutting down, restarting or signing out. It ends Slate
+        // without WM_CLOSE, so everything is written now and no question is
+        // asked; the running marker stays, so the next start restores it all.
+        WM_QUERYENDSESSION => {
+            a.persist();
+            return LRESULT(1);
+        }
+        WM_ENDSESSION => {
+            if wp.0 != 0 {
+                let huge = a.bufs.iter().any(|b| b.dirty() && b.doc.len() >= app::HUGE);
+                if huge {
+                    let why: Vec<u16> = "Saving a copy of unsaved changes\0".encode_utf16().collect();
+                    let _ = windows::Win32::System::Shutdown::ShutdownBlockReasonCreate(hwnd, PCWSTR(why.as_ptr()));
+                }
+                a.persist_for_shutdown();
+                let mut wpl = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+                if GetWindowPlacement(hwnd, &mut wpl).is_ok() {
+                    let r = wpl.rcNormalPosition;
+                    settings::get_mut().win = Some((r.left, r.top, r.right - r.left, r.bottom - r.top, a.maximized));
+                }
+                settings::save();
+                if huge {
+                    let _ = windows::Win32::System::Shutdown::ShutdownBlockReasonDestroy(hwnd);
+                }
+            }
+            return LRESULT(0);
         }
         WM_DESTROY => {
             let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
@@ -547,8 +577,16 @@ fn main() {
         if !bench {
             app.team_start();
         }
-        if handover.is_some() || (!no_session && settings::get().restore_session) {
+        let unclean = !no_session && settings::running_marker().exists();
+        if handover.is_some() || (!no_session && (settings::get().restore_session || unclean)) {
             app.restore_session();
+        }
+        if !no_session {
+            let _ = std::fs::create_dir_all(settings::dir());
+            let _ = std::fs::write(settings::running_marker(), std::process::id().to_string());
+            // After a restart for Windows updates, Windows starts Slate again
+            // (when "restart apps" is on) and the session comes back.
+            let _ = windows::Win32::System::Recovery::RegisterApplicationRestart(PCWSTR::null(), windows::Win32::System::Recovery::REGISTER_APPLICATION_RESTART_FLAGS(1 | 2));
         }
         if handover.is_none() && !bench {
             update::cleanup();

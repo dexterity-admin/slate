@@ -657,6 +657,7 @@ impl App {
         vw.tabs.insert(at, Tab { buf: id, top: 0, sub: 0, x: 0.0 });
         vw.active = at;
         self.av = v;
+        self.schedule_persist();
     }
 
     pub fn new_file(&mut self) {
@@ -988,6 +989,7 @@ impl App {
             let _ = std::fs::remove_file(settings::backup_dir().join(bk));
         }
         settings::push_recent(&path.to_string_lossy());
+        self.schedule_persist();
         self.flash(&format!("Saved {}", path.display()));
         self.collab_saved(id);
         self.update_title();
@@ -1050,6 +1052,7 @@ impl App {
                 self.new_file();
             }
         }
+        self.schedule_persist();
         // The two sides of a compare close together.
         if let Some((pv, pi)) = partner.and_then(|p| self.find_open_id(p)) {
             return self.close_tab(pv, pi);
@@ -1165,22 +1168,52 @@ impl App {
     pub fn edited(&mut self) {
         self.collab_flush();
         self.team_on_edit();
-        if !self.backup_pending {
-            self.backup_pending = true;
-            unsafe {
-                SetTimer(self.hwnd, T_BACKUP, 8000, None);
-            }
-        }
+        self.schedule_persist();
         self.update_title();
     }
 
+    /// Writes backups and the session soon: within 2 s of an edit or of a
+    /// tab opening or closing, so a crash or power cut loses little. Big
+    /// unsaved files are copied less often, as each copy takes a while.
+    pub fn schedule_persist(&mut self) {
+        if self.backup_pending || self.no_session {
+            return;
+        }
+        self.backup_pending = true;
+        let big = self.bufs.iter().any(|b| b.dirty() && b.doc.len() >= 8 << 20);
+        unsafe {
+            SetTimer(self.hwnd, T_BACKUP, if big { 8000 } else { 2000 }, None);
+        }
+    }
+
+    /// Backups of the unsaved text, then the session that lists them, so
+    /// what is on disk always describes every open tab.
+    pub fn persist(&mut self) {
+        if self.no_session {
+            return;
+        }
+        self.write_backups(false);
+        self.write_session(true);
+    }
+
+    /// Windows is shutting down or restarting: everything goes to disk now,
+    /// with no questions, even the huge files that otherwise get no copy.
+    pub fn persist_for_shutdown(&mut self) {
+        if self.no_session {
+            return;
+        }
+        self.write_backups(true);
+        self.write_session(true);
+    }
+
     /// Writes changed dirty buffers to the backup folder (crash safety).
-    pub fn write_backups(&mut self) {
+    /// `huge`: copy files of 64 MB and more too.
+    pub fn write_backups(&mut self, huge: bool) {
         self.backup_pending = false;
         unsafe {
             let _ = KillTimer(self.hwnd, T_BACKUP);
         }
-        if !settings::get().restore_session || self.no_session {
+        if self.no_session {
             return;
         }
         let dir = settings::backup_dir();
@@ -1199,8 +1232,12 @@ impl App {
                 continue;
             }
             // Writing a huge file every few seconds would stall everything;
-            // closing Slate asks to save it instead.
-            if b.doc.len() >= HUGE {
+            // closing Slate asks to save it instead, and shutting down copies it.
+            if b.doc.len() >= HUGE && !huge {
+                continue;
+            }
+            // Text still arriving from disk is not the user's work.
+            if b.loading.is_some() {
                 continue;
             }
             if !made_dir {
@@ -1211,7 +1248,7 @@ impl App {
                 let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
                 format!("{}@{stamp}-{}.txt", sanitize(&b.name()), b.id)
             });
-            if std::fs::write(dir.join(&name), b.text_all()).is_ok() {
+            if write_atomic(&dir.join(&name), &b.text_all()).is_ok() {
                 b.backup = Some(name);
                 b.backed_up_gen = b.gen;
             }
@@ -1238,7 +1275,14 @@ impl App {
         if self.no_session {
             return;
         }
-        self.write_backups();
+        self.write_backups(false);
+        self.write_session(restore);
+    }
+
+    /// Writes session.ini: every tab when `restore`, else only the layout.
+    /// Backups are never swept here: one not listed may be the only copy of
+    /// someone's work, and the next start recovers it.
+    fn write_session(&mut self, restore: bool) {
         let mut out = String::from("# Slate session\n");
         out += &format!("split={}\nactive_view={}\nsplit_frac={}\n", self.split as u8, self.av, self.split_frac);
         if restore {
@@ -1271,17 +1315,7 @@ impl App {
             }
         }
         let _ = std::fs::create_dir_all(settings::dir());
-        let _ = std::fs::write(settings::dir().join("session.ini"), out);
-        // Backups not referenced by any buffer are stale.
-        let keep: Vec<String> = self.bufs.iter().filter_map(|b| b.backup.clone()).collect();
-        if let Ok(rd) = std::fs::read_dir(settings::backup_dir()) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if !keep.contains(&n) {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
+        let _ = write_atomic(&settings::dir().join("session.ini"), out.as_bytes());
     }
 
     pub fn restore_session(&mut self) {
@@ -1307,12 +1341,27 @@ impl App {
             }
         }
         let mut actives = [None, None];
+        let bdir = settings::backup_dir();
+        // Copies cut short by a crash or power cut; the real backup beside
+        // each is whole, as it is only ever replaced by a finished copy.
+        if let Ok(rd) = std::fs::read_dir(&bdir) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().ends_with(".part") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let mut listed = std::collections::HashSet::new();
         for t in tabs {
             let v: usize = t.get("view").and_then(|x| x.parse().ok()).unwrap_or(0).min(1);
             let path = t.get("path").cloned();
             let backup = t.get("backup").cloned();
-            let id = if let Some(bk) = &backup {
-                let Ok(text) = std::fs::read(settings::backup_dir().join(bk)) else { continue };
+            if let Some(bk) = &backup {
+                listed.insert(bk.clone());
+            }
+            // A backup is gone once its file was saved: the file is current.
+            let saved = backup.as_ref().and_then(|bk| std::fs::read(bdir.join(bk)).ok().map(|text| (bk, text)));
+            let id = if let Some((bk, text)) = saved {
                 let id = self.new_buffer(text);
                 let b = self.bufs.last_mut().unwrap();
                 b.backup = Some(bk.clone());
@@ -1372,6 +1421,36 @@ impl App {
                 actives[v] = Some(self.views[v].tabs.len() - 1);
             }
         }
+        // Unsaved text the session does not list (Slate ended between writing
+        // it and the session): open it rather than lose it.
+        let mut orphans: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(&bdir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        (n.ends_with(".txt") && !listed.contains(&n)).then(|| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), n))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        orphans.sort();
+        let mut recovered = Vec::new();
+        for (_, bk) in orphans {
+            let Ok(text) = std::fs::read(bdir.join(&bk)) else { continue };
+            let id = self.new_buffer(text);
+            let n = self.next_untitled;
+            self.next_untitled += 1;
+            let b = self.bufs.last_mut().unwrap();
+            b.backup = Some(bk.clone());
+            b.mark_unsaved();
+            b.untitled = n;
+            self.views[0].tabs.push(Tab { buf: id, top: 0, sub: 0, x: 0.0 });
+            actives[0] = Some(self.views[0].tabs.len() - 1);
+            recovered.push(bk.split('@').next().unwrap_or("").to_string());
+        }
+        if !recovered.is_empty() {
+            self.flash(&format!("Recovered unsaved text: {} \u{2013} save it or close the tab to discard it", recovered.join(", ")));
+        }
         for v in 0..2 {
             self.views[v].active = actives[v].unwrap_or(0).min(self.views[v].tabs.len().saturating_sub(1));
         }
@@ -1384,6 +1463,8 @@ impl App {
             self.views[0].tabs.extend(moved);
         }
         self.av = if self.split { av.min(1) } else { 0 };
+        // List recovered text in the session straight away.
+        self.schedule_persist();
     }
 
     pub fn ensure_tab(&mut self) {
@@ -2710,6 +2791,36 @@ pub fn fuzzy(q: &str, s: &str) -> Option<i32> {
         }
     }
     (qi == qc.len() && cost <= 1).then_some(500 - runs * 10 - cost * 50)
+}
+
+/// Writes a file so that a crash or power cut leaves either the old or the
+/// new contents, never half of each: a full copy beside it, flushed to the
+/// disk, then renamed over it.
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    {
+        let mut f = std::fs::File::create(&part)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    // Antivirus may hold the old file for a moment.
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(&part, path) {
+            Ok(()) => return Ok(()),
+            Err(_) if tries < 5 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                return Err(e);
+            }
+        }
+    }
 }
 
 fn sanitize(s: &str) -> String {
