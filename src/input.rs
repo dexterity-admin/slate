@@ -1,6 +1,6 @@
 //! Keyboard and mouse handling.
 
-use crate::app::{Action, App, Cmd, Drag, Hit, PalMode, TITLE_H};
+use crate::app::{Action, App, Cmd, Drag, Hit, TITLE_H};
 use crate::buffer::{EditKind, Sel};
 use crate::edit::{self, Move};
 use crate::sys;
@@ -89,6 +89,7 @@ fn key_cmd(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<Cmd> {
         (false, false, false, VK_INSERT) => Cmd::Overtype,
         (true, true, false, v) if v == k('G') => Cmd::Grid,
         (true, false, true, v) if v == k('C') => Cmd::Compare,
+        (true, true, false, v) if v == k('E') => Cmd::CoEdit,
         (false, false, false, 0x76) => Cmd::CompareNext,
         (false, true, false, 0x76) => Cmd::ComparePrev,
         (false, false, false, 0x74) => Cmd::CompareRefresh,
@@ -272,8 +273,9 @@ impl App {
             self.grid_char(ch);
             return;
         }
-        if self.in_compare() {
-            self.flash("The compare view is read-only \u{2013} edit the file itself, then F5 refreshes");
+        if self.cur_ref().read_only() {
+            let msg = self.read_only_reason();
+            self.flash(&msg);
             return;
         }
         self.record(Action::Char(ch));
@@ -341,7 +343,7 @@ impl App {
             } else if p.sel >= p.scroll + PAL_MAX {
                 p.scroll = p.sel + 1 - PAL_MAX;
             }
-            if p.mode == PalMode::Goto {
+            if p.mode.is_text() {
                 p.shown.clear();
             }
         }
@@ -424,6 +426,7 @@ impl App {
         self.pressed = hit;
         match hit {
             Hit::Menu => self.command_palette(),
+            Hit::People => self.team_people(),
             Hit::Grid(v) => self.grid_mouse_down(v, x, y, shift),
             Hit::Tab(v, i) => {
                 self.views[v].active = i;
@@ -855,6 +858,7 @@ impl App {
             9 => Cmd::InstallUpdate,
             10 => Cmd::Grid,
             11 => Cmd::GridDelim,
+            12 | 13 => return self.team_file_menu(),
             _ => return,
         };
         self.exec(c);

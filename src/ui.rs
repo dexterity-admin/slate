@@ -21,6 +21,10 @@ pub const FB_REPLALL: usize = 7;
 pub const FB_MODE: usize = 8;
 pub const FB_SEARCH: usize = 9;
 
+pub const AVATAR: f32 = 22.0;
+/// Avatars shown before "+N".
+pub const PEOPLE_MAX: usize = 5;
+
 /// Short file-type label and colour shown on a tab, from the extension.
 pub fn badge(b: &crate::buffer::Buffer) -> Option<(String, u32)> {
     if b.diff.is_some() {
@@ -90,6 +94,18 @@ impl App {
             (Hit::Max, r(w - 2.0 * CAP_W, 0.0, CAP_W, TITLE_H)),
             (Hit::Close, r(w - CAP_W, 0.0, CAP_W, TITLE_H)),
         ]
+    }
+
+    /// Title-bar avatars of the team: you, then the others online.
+    pub fn people_rect(&self) -> Option<Rect> {
+        self.team.as_ref()?;
+        let n = self.team_online().len().min(PEOPLE_MAX) + 1;
+        let extra = if self.team_online().len() > PEOPLE_MAX { 26.0 } else { 0.0 };
+        // You stand apart; the others overlap a little.
+        let others = (n - 1) as f32;
+        let w = AVATAR + if others > 0.0 { 6.0 + AVATAR + (others - 1.0) * (AVATAR - 6.0) } else { 0.0 } + extra + 12.0;
+        let right = self.w - 3.0 * CAP_W - 8.0 - if self.recording.is_some() { 130.0 } else { 0.0 };
+        Some(r(right - w, (TITLE_H - AVATAR) / 2.0 - 2.0, w, AVATAR + 4.0))
     }
 
     /// Tab rectangles of view `v` and the "+" button.
@@ -224,6 +240,9 @@ impl App {
                 if rc.has(x, y) {
                     return h;
                 }
+            }
+            if self.people_rect().map_or(false, |rc| rc.has(x, y)) {
+                return Hit::People;
             }
             return Hit::Caption;
         }

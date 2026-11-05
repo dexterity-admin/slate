@@ -87,6 +87,14 @@ pub struct Buffer {
     pub grid: Option<Box<crate::csv::Grid>>,
     /// One side of a revision compare; such a buffer is read-only.
     pub diff: Option<Box<crate::diff::DiffView>>,
+    /// This Slate holds the team edit lock on the file, since (unix time).
+    pub lock_since: Option<u64>,
+    /// Someone else holds the team edit lock: the buffer is read-only.
+    pub locked_by: Option<String>,
+    /// "Someone else is editing this too" was already shown.
+    pub team_warned: bool,
+    /// Live co-editing session on this file.
+    pub collab: Option<Box<crate::collab::Collab>>,
 }
 
 pub fn display_name(path: &Option<PathBuf>, untitled: usize) -> String {
@@ -126,7 +134,16 @@ impl Buffer {
             loading: None,
             grid: None,
             diff: None,
+            lock_since: None,
+            locked_by: None,
+            team_warned: false,
+            collab: None,
         }
+    }
+
+    /// Compare sides and files someone else locked cannot be edited.
+    pub fn read_only(&self) -> bool {
+        self.diff.is_some() || self.locked_by.is_some()
     }
 
     pub fn name(&self) -> String {
@@ -214,7 +231,7 @@ impl Buffer {
     /// ascending order, records them as one undo step and maps selections.
     pub fn apply(&mut self, mut changes: Vec<(usize, usize, Vec<u8>)>, kind: EditKind) {
         changes.retain(|(a, b, t)| a != b || !t.is_empty());
-        if changes.is_empty() || self.diff.is_some() {
+        if changes.is_empty() || self.read_only() {
             return;
         }
         changes.sort_by_key(|c| c.0);
@@ -263,7 +280,54 @@ impl Buffer {
         self.want_col = None;
     }
 
+    /// Applies a co-editor's change: no undo step, and the local undo
+    /// history is dropped because its positions no longer hold. `changes`
+    /// are ascending, in the coordinates before the change.
+    pub fn apply_remote(&mut self, changes: &[(usize, usize, Vec<u8>)]) {
+        if changes.is_empty() {
+            return;
+        }
+        if let Some(c) = self.collab.as_mut() {
+            c.muted = true;
+        }
+        for (a, b, t) in changes.iter().rev() {
+            let old = self.doc.text(*a, *b);
+            self.raw_replace(*a, &old, t);
+        }
+        if let Some(c) = self.collab.as_mut() {
+            c.muted = false;
+        }
+        let map = |p: usize| -> usize {
+            let mut d: isize = 0;
+            for (a, b, t) in changes {
+                // A caret where the other person typed stays before it.
+                if p <= *a {
+                    break;
+                }
+                if p < *b {
+                    return (*a as isize + d) as usize;
+                }
+                d += t.len() as isize - (*b - *a) as isize;
+            }
+            (p as isize + d) as usize
+        };
+        for s in self.sels.iter_mut() {
+            s.anchor = map(s.anchor);
+            s.head = map(s.head);
+        }
+        self.normalize();
+        self.undo.clear();
+        self.redo.clear();
+        self.mark_unsaved();
+        self.seal = true;
+    }
+
     fn raw_replace(&mut self, at: usize, old: &[u8], new: &[u8]) {
+        if let Some(c) = self.collab.as_mut() {
+            if !c.muted {
+                c.outbox.push((self.doc.len(), at, at + old.len(), new.to_vec()));
+            }
+        }
         let line = self.doc.line_of(at);
         self.doc.remove_at(at, old.len());
         self.doc.insert_at(at, new);
@@ -294,6 +358,9 @@ impl Buffer {
     }
 
     pub fn undo(&mut self) -> bool {
+        if self.read_only() {
+            return false;
+        }
         let Some(mut g) = self.undo.pop() else { return false };
         g.after = self.sels.clone();
         for c in g.changes.iter().rev() {
@@ -308,6 +375,9 @@ impl Buffer {
     }
 
     pub fn redo(&mut self) -> bool {
+        if self.read_only() {
+            return false;
+        }
         let Some(g) = self.redo.pop() else { return false };
         for c in g.changes.iter() {
             self.raw_replace(c.at, &c.old, &c.new);

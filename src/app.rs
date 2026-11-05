@@ -53,6 +53,7 @@ pub enum Cmd {
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
     Compare, CompareFile, CompareSaved, CompareNext, ComparePrev, CompareRefresh, CompareSwap,
     CompareWs, CompareCase, CompareClose,
+    TeamPeople, TeamLock, TeamFolder, TeamName, CoEdit,
 }
 
 pub static COMMANDS: &[(Cmd, &str, &str)] = &[
@@ -145,6 +146,11 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::CompareWs, "Compare: Toggle Ignore Whitespace", ""),
     (Cmd::CompareCase, "Compare: Toggle Ignore Case", ""),
     (Cmd::CompareClose, "Compare: Close Compare", ""),
+    (Cmd::TeamPeople, "Team: Who's Online\u{2026}", ""),
+    (Cmd::CoEdit, "Team: Co-edit This File (Start / Join / Leave)", "Ctrl+Shift+E"),
+    (Cmd::TeamLock, "Team: Lock / Unlock This File for Editing", ""),
+    (Cmd::TeamFolder, "Team: Set Team Folder\u{2026}", ""),
+    (Cmd::TeamName, "Team: Set Your Display Name\u{2026}", ""),
     (Cmd::Language, "Document: Set Language…", ""),
     (Cmd::Encoding, "Document: Convert Encoding…", ""),
     (Cmd::ReopenEncoding, "Document: Reopen with Encoding…", ""),
@@ -270,6 +276,15 @@ pub enum PalMode {
     Commands,
     Goto,
     List,
+    /// Free text answered with Enter: 1 team folder, 2 display name.
+    Prompt(u8),
+}
+
+impl PalMode {
+    /// Typed text is the answer; there is no list to pick from.
+    pub fn is_text(self) -> bool {
+        matches!(self, PalMode::Goto | PalMode::Prompt(_))
+    }
 }
 
 pub struct Palette {
@@ -364,6 +379,8 @@ pub enum Hit {
     PalInput,
     Overlay,
     Grid(usize),
+    /// The online-people avatars in the title bar.
+    People,
 }
 
 pub enum Drag {
@@ -446,6 +463,10 @@ pub struct App {
     pub grid_hover: crate::grid::GHit,
     /// Last scroll state both compare sides were synced to.
     pub cmp_sync: Option<(usize, usize, f32)>,
+    /// Team folder connection (presence, locks, co-editing).
+    pub team: Option<crate::team::Team>,
+    /// Co-editing sessions already offered, with who was offered.
+    pub collab_offered: HashMap<String, String>,
 }
 
 pub fn invalidate(hwnd: HWND) {
@@ -507,6 +528,8 @@ impl App {
             exiting_for_update: false,
             grid_hover: crate::grid::GHit::None,
             cmp_sync: None,
+            team: None,
+            collab_offered: HashMap::new(),
         }
     }
 
@@ -637,6 +660,8 @@ impl App {
         }
         self.auto_grid(id);
         self.after_switch();
+        self.team_apply_locks();
+        self.team_on_open(id);
         true
     }
 
@@ -701,6 +726,8 @@ impl App {
                         self.flash(&format!("{name}: mixed line endings unified to {} (applies on save)", eol.name()));
                     }
                     self.auto_grid(l.id);
+                    self.team_apply_locks();
+                    self.team_on_open(l.id);
                 }
                 Err(e) => {
                     let name = self.bufs[i].name();
@@ -764,6 +791,7 @@ impl App {
         }
         settings::push_recent(&path.to_string_lossy());
         self.flash(&format!("Saved {}", path.display()));
+        self.collab_saved(id);
         self.update_title();
         true
     }
@@ -849,6 +877,15 @@ impl App {
         self.redraw();
     }
 
+    /// Why the current buffer cannot be edited.
+    pub fn read_only_reason(&self) -> String {
+        let b = self.cur_ref();
+        match &b.locked_by {
+            Some(by) => format!("{by} has locked this file for editing \u{2013} it is read-only until they unlock or close it"),
+            None => "The compare view is read-only \u{2013} edit the file itself, then F5 refreshes".into(),
+        }
+    }
+
     pub fn update_title(&self) {
         let b = self.cur_ref();
         let t = match &b.path {
@@ -859,6 +896,8 @@ impl App {
         unsafe {
             let _ = SetWindowTextW(self.hwnd, windows::core::PCWSTR(w.as_ptr()));
         }
+        // Open files and their saved state changed: tell the team.
+        self.team_publish();
     }
 
     pub fn flash(&mut self, msg: &str) {
@@ -892,6 +931,8 @@ impl App {
     }
 
     pub fn edited(&mut self) {
+        self.collab_flush();
+        self.team_on_edit();
         if !self.backup_pending {
             self.backup_pending = true;
             unsafe {
@@ -1122,6 +1163,11 @@ impl App {
             let b = &self.bufs[i];
             let Some(p) = &b.path else { continue };
             let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified()) else { continue };
+            // Co-editors save the shared text; that is not an outside change.
+            if b.collab.is_some() {
+                self.bufs[i].mtime = Some(m);
+                continue;
+            }
             if b.mtime.is_some() && b.mtime != Some(m) {
                 if b.dirty() {
                     ask.push(b.id);
@@ -1145,6 +1191,9 @@ impl App {
 
     pub fn reload(&mut self, id: u32, force: Option<Enc>) {
         let i = self.bi(id);
+        if self.bufs[i].collab.is_some() {
+            return self.flash("Leave co-editing (Ctrl+Shift+E) before reloading from disk");
+        }
         let Some(p) = self.bufs[i].path.clone() else { return };
         let Ok(raw) = crate::doc::read_for_doc(&p) else { return };
         let d = enc::decode(raw, force);
@@ -1158,6 +1207,8 @@ impl App {
         nb.mixed_eol = d.mixed_eol;
         nb.lang = old.lang;
         nb.untitled = old.untitled;
+        nb.lock_since = old.lock_since;
+        nb.locked_by = old.locked_by.clone();
         nb.bookmarks = old.bookmarks.clone();
         nb.tab_size = old.tab_size;
         nb.mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
@@ -1449,6 +1500,14 @@ impl App {
 
     pub fn palette_accept(&mut self) {
         let Some(p) = self.palette.take() else { return };
+        if let PalMode::Prompt(k) = p.mode {
+            let text = p.input.text.clone();
+            match k {
+                1 => self.team_set_folder(&text),
+                _ => self.team_set_name(&text),
+            }
+            return self.redraw();
+        }
         if p.mode == PalMode::Goto {
             let t = p.input.text.trim_start_matches(':').trim();
             let mut it = t.split([':', ',']);
@@ -1603,7 +1662,7 @@ impl App {
             self.flash("Open the grid first \u{2013} Ctrl+Shift+G");
             return;
         }
-        if self.in_compare() {
+        if self.cur_ref().read_only() {
             let edits = matches!(
                 c,
                 Cmd::Save | Cmd::SaveAs | Cmd::Cut | Cmd::Paste | Cmd::Undo | Cmd::Redo | Cmd::Replace | Cmd::ToggleComment
@@ -1612,15 +1671,42 @@ impl App {
                     | Cmd::Trim | Cmd::Join | Cmd::TabsToSpaces | Cmd::SpacesToTabs | Cmd::MacroPlay | Cmd::Encoding
                     | Cmd::ReopenEncoding | Cmd::LineEnding | Cmd::Grid | Cmd::ToggleFold | Cmd::FoldAll
             );
+            // Saving a locked file is fine: it is unchanged.
+            let edits = edits && !(self.cur_ref().diff.is_none() && matches!(c, Cmd::Save | Cmd::SaveAs));
             if edits {
-                self.flash("The compare view is read-only \u{2013} edit the file itself, then F5 refreshes");
+                let msg = self.read_only_reason();
+                self.flash(&msg);
                 return;
             }
-            if c == Cmd::Reload {
+            if c == Cmd::Reload && self.in_compare() {
                 return self.cmp_refresh();
             }
         }
         match c {
+            Cmd::TeamPeople => {
+                self.team_people();
+                changed = false;
+            }
+            Cmd::TeamLock => {
+                self.team_toggle_lock();
+                changed = false;
+            }
+            Cmd::CoEdit => {
+                self.collab_toggle();
+                changed = false;
+            }
+            Cmd::TeamFolder => {
+                let cur = crate::team::team_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                let title = "Team folder: a shared folder everyone can write to (empty turns team features off)";
+                self.open_palette(PalMode::Prompt(1), title, Vec::new(), &cur);
+                changed = false;
+            }
+            Cmd::TeamName => {
+                let title = "Your name as others see it";
+                let cur = crate::team::my_name();
+                self.open_palette(PalMode::Prompt(2), title, Vec::new(), &cur);
+                changed = false;
+            }
             Cmd::Compare => {
                 self.compare_with();
                 changed = false;

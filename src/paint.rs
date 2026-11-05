@@ -1,6 +1,6 @@
 //! Frame rendering: title bar, tab strips, editors, status bar, overlays.
 
-use crate::app::{App, Hit, Input, PalMode, CAP_W, SCROLL_W, STATUS_H, TAB_H, TITLE_H};
+use crate::app::{App, Hit, Input, CAP_W, SCROLL_W, STATUS_H, TAB_H, TITLE_H};
 use crate::gfx::{rect, C};
 use crate::icons::Icon;
 
@@ -27,6 +27,8 @@ impl App {
             self.gfx.rt().Clear(Some(&self.gfx.color(C::Bg)));
         }
         self.cmp_sync_views();
+        // Co-editors see the caret wherever it moved since the last frame.
+        self.collab_cursor();
         let views = if self.split { 2 } else { 1 };
         for v in 0..views {
             self.paint_view(v);
@@ -137,8 +139,29 @@ impl App {
         };
         let title = format!("{name}{}", if b.dirty() { "  \u{2022}" } else { "" });
         let tx = MENU_W + 28.0;
-        let tw = self.w - tx - 3.0 * CAP_W - 16.0;
+        let right = self.people_rect().map_or(self.w - 3.0 * CAP_W, |rc| rc.x);
+        let tw = right - tx - 16.0;
         g.text(&title, g.ui.as_ref().unwrap(), tx, 0.0, tw, TITLE_H, C::Dim);
+        if let Some(rc) = self.people_rect() {
+            if self.hover == Hit::People {
+                g.fill_alpha(rc.x, rc.y, rc.w, rc.h, 6.0, C::Hover, ha);
+            }
+            let online = self.team_online();
+            let reachable = self.team.as_ref().map_or(false, |t| t.reachable);
+            let me = crate::team::my_name();
+            let y = rc.y + 2.0;
+            let mut x = rc.x + 6.0;
+            // You first, as an outline; dimmed while the folder is unreachable.
+            self.draw_avatar(x, y, &crate::team::initials(&me), crate::team::color_for(&me), false, reachable);
+            x += AVATAR + 6.0;
+            for (ini, rgb, _) in online.iter().take(PEOPLE_MAX) {
+                self.draw_avatar(x, y, ini, *rgb, true, reachable);
+                x += AVATAR - 6.0;
+            }
+            if online.len() > PEOPLE_MAX {
+                g.text(&format!("+{}", online.len() - PEOPLE_MAX), g.ui_small.as_ref().unwrap(), x + 8.0, rc.y, 30.0, rc.h, C::Dim);
+            }
+        }
         if self.recording.is_some() {
             let rw = 120.0;
             g.fill_round(self.w - 3.0 * CAP_W - rw - 10.0, 8.0, rw, 18.0, 9.0, C::Danger);
@@ -159,6 +182,29 @@ impl App {
             g.draw_icon(icon, rc.x, rc.y, rc.w, rc.h, c, 12.0, 1.1);
         }
         g.fill(0.0, TITLE_H - 1.0, self.w, 1.0, C::Border);
+    }
+
+    /// A round badge with initials; `filled` for others, an outline for you.
+    fn draw_avatar(&self, x: f32, y: f32, ini: &str, rgb: u32, filled: bool, live: bool) {
+        let g = &self.gfx;
+        let s = AVATAR;
+        let a = if live { 1.0 } else { 0.4 };
+        unsafe {
+            let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(x, y, s, s), radiusX: s / 2.0, radiusY: s / 2.0 };
+            // A ring in the title colour separates overlapping avatars.
+            let ring = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(x - 1.5, y - 1.5, s + 3.0, s + 3.0), radiusX: s / 2.0 + 1.5, radiusY: s / 2.0 + 1.5 };
+            g.rt().FillRoundedRectangle(&ring, g.b(C::Chrome));
+            if filled {
+                g.rt().FillRoundedRectangle(&rr, &g.tint(rgb, a));
+            } else {
+                g.rt().FillRoundedRectangle(&rr, &g.tint(rgb, 0.18 * a));
+                g.rt().DrawRoundedRectangle(&rr, &g.tint(rgb, a), 1.5, None);
+            }
+        }
+        let f = g.ui_small.as_ref().unwrap();
+        let w = g.measure(ini, f);
+        let c = if filled { C::OnAccent } else { C::Fg };
+        g.text(ini, f, x + (s - w) / 2.0, y, s, s, c);
     }
 
     fn paint_tabs(&self, v: usize) {
@@ -196,8 +242,21 @@ impl App {
             }
             let fg = if active { C::Fg } else { C::Dim };
             let f = if active { g.ui_bold.as_ref() } else { g.ui.as_ref() };
-            g.text(&b.name(), f.unwrap(), tx, t.y, t.x + t.w - 30.0 - tx, t.h - 1.0, fg);
             let cr = Self::tab_close_rect(t);
+            // Dots for the people who have this file open too.
+            let others = self.team_others(self.bi(tab.buf));
+            let dots = others.len().min(3) as f32 * 8.0;
+            for (k, (_, rgb, st)) in others.iter().take(3).enumerate() {
+                let dx = cr.x - 6.0 - (k + 1) as f32 * 8.0;
+                let alpha = if *st == crate::team::FileState::Open { 0.55 } else { 1.0 };
+                unsafe {
+                    let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(dx, t.y + t.h / 2.0 - 3.5, 7.0, 7.0), radiusX: 3.5, radiusY: 3.5 };
+                    g.rt().FillRoundedRectangle(&rr, &g.tint(*rgb, alpha));
+                }
+            }
+            let live = b.collab.is_some();
+            let name = if live { format!("{} \u{25CF}", b.name()) } else { b.name() };
+            g.text(&name, f.unwrap(), tx, t.y, t.x + t.w - 30.0 - dots - tx, t.h - 1.0, fg);
             let close_hover = self.hover == Hit::TabClose(v, i);
             if close_hover {
                 g.fill_alpha(cr.x, cr.y, cr.w, cr.h, 4.0, C::Hover, 1.0);
@@ -393,6 +452,23 @@ impl App {
                 }
             }
         }
+        // Co-editors' carets, with their names.
+        for (pos, name, rgb) in self.collab_carets(bi) {
+            let line = self.bufs[bi].doc.line_of(pos);
+            let Some(row) = rows.iter().find(|r| r.line == line) else { continue };
+            let (x, y) = self.pos_xy(bi, line, pos, wrap);
+            let (cx, cy) = (tx - sx + x, row.y + y);
+            if cx < tx - 1.0 || cx > tx + tw {
+                continue;
+            }
+            let g = &self.gfx;
+            g.fill_tint(cx - 1.0, cy, 2.0, lh, rgb, 1.0);
+            let f = g.ui_small.as_ref().unwrap();
+            let w = g.measure(&name, f) + 8.0;
+            let ty2 = if cy - 15.0 >= ty { cy - 15.0 } else { cy + lh };
+            g.fill_tint(cx - 1.0, ty2, w, 15.0, rgb, 1.0);
+            g.text(&name, f, cx + 3.0, ty2 - 1.0, w, 16.0, C::OnAccent);
+        }
         self.gfx.unclip();
 
         // Gutter.
@@ -519,6 +595,14 @@ impl App {
             }
             if self.overtype {
                 segs.push(("OVR".into(), 7));
+            }
+            if let Some(c) = &b.collab {
+                let people = self.collab_people(&c.sid);
+                let who: Vec<&str> = people.iter().map(|s| s.as_str()).collect();
+                let text = if who.is_empty() { "Co-editing \u{2013} waiting for others".to_string() } else { format!("Co-editing with {}", crate::team::join_names(&who)) };
+                segs.push((text, 13));
+            } else if let Some(t) = self.team_status() {
+                segs.push((t, 12));
             }
             if s.wrap {
                 segs.push(("Wrap".into(), 6));
@@ -752,7 +836,7 @@ impl App {
         self.draw_input(&p.input, &inp, true, &ph, 0.0);
         let ui = g.ui.as_ref().unwrap();
         let small = g.ui_small.as_ref().unwrap();
-        if p.mode == PalMode::Goto {
+        if p.mode.is_text() {
             g.text(&p.title, small, pr.x + 16.0, pr.y + PAL_INPUT + 5.0, pr.w - 32.0, PAL_ROW, C::Dim);
             return;
         }
