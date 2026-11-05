@@ -53,8 +53,8 @@ pub enum Cmd {
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
     Compare, CompareFile, CompareSaved, CompareNext, ComparePrev, CompareRefresh, CompareSwap,
     CompareWs, CompareCase, CompareClose,
-    TeamPeople, TeamLock, TeamFolder, TeamName, CoEdit, TeamSearch,
-    LibSnippet, LibSaveSnippet, LibMacro, LibSaveMacro, LibPreset, LibSavePreset, LibFolder,
+    TeamPeople, TeamLock, TeamToggle, TeamName, CoEdit, TeamSearch,
+    LibSnippet, LibSaveSnippet, LibMacro, LibSaveMacro, LibPreset, LibSavePreset, LibFolder, LibDelete,
 }
 
 pub static COMMANDS: &[(Cmd, &str, &str)] = &[
@@ -150,7 +150,7 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::TeamPeople, "Team: Who's Online\u{2026}", ""),
     (Cmd::CoEdit, "Team: Co-edit This File (Start / Join / Leave)", "Ctrl+Shift+E"),
     (Cmd::TeamLock, "Team: Lock / Unlock This File for Editing", ""),
-    (Cmd::TeamFolder, "Team: Set Team Folder\u{2026}", ""),
+    (Cmd::TeamToggle, "Settings: Toggle Team Features (LAN)", ""),
     (Cmd::TeamName, "Team: Set Your Display Name\u{2026}", ""),
     (Cmd::TeamSearch, "Search: Instant Search in Team Index\u{2026}", "Ctrl+Shift+I"),
     (Cmd::LibSnippet, "Library: Insert Snippet\u{2026}", ""),
@@ -159,6 +159,7 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::LibSaveMacro, "Library: Share Last Macro\u{2026}", ""),
     (Cmd::LibPreset, "Library: Use Find / Replace Preset\u{2026}", ""),
     (Cmd::LibSavePreset, "Library: Save Find / Replace as Preset\u{2026}", ""),
+    (Cmd::LibDelete, "Library: Delete an Item\u{2026}", ""),
     (Cmd::LibFolder, "Library: Open Library Folder", ""),
     (Cmd::Language, "Document: Set Language…", ""),
     (Cmd::Encoding, "Document: Convert Encoding…", ""),
@@ -274,6 +275,7 @@ pub enum PalAct {
     Compare(u32),
     /// Team library files.
     Snippet(String),
+    LibDelete(u8, String),
     Macro(String),
     Preset(String),
 }
@@ -480,7 +482,11 @@ pub struct App {
     /// Team folder connection (presence, locks, co-editing).
     pub team: Option<crate::team::Team>,
     /// Co-editing sessions already offered, with who was offered.
-    pub collab_offered: HashMap<String, String>,
+    pub collab_offered: HashMap<u64, u64>,
+    /// The team library held on this PC.
+    pub library: crate::library::Store,
+    /// The instant search waiting for the hub's answer.
+    pub search_qid: Option<u64>,
 }
 
 pub fn invalidate(hwnd: HWND) {
@@ -544,6 +550,8 @@ impl App {
             cmp_sync: None,
             team: None,
             collab_offered: HashMap::new(),
+            library: crate::library::Store::load(),
+            search_qid: None,
         }
     }
 
@@ -829,6 +837,9 @@ impl App {
                 sys::Answer::No => {}
                 sys::Answer::Cancel => return false,
             }
+        }
+        if !elsewhere && self.bufs[i].collab.is_some() {
+            self.collab_leave(i);
         }
         self.views[v].tabs.remove(idx);
         let partner = self.bufs[i].diff.as_ref().map(|d| d.partner).filter(|_| !elsewhere);
@@ -1529,7 +1540,6 @@ impl App {
         if let PalMode::Prompt(k) = p.mode {
             let text = p.input.text.clone();
             match k {
-                1 => self.team_set_folder(&text),
                 2 => self.team_set_name(&text),
                 3 => self.team_search(&text),
                 4 => self.lib_save_snippet(&text),
@@ -1604,6 +1614,7 @@ impl App {
             PalAct::Delim(d) => self.grid_set_delim(d),
             PalAct::Compare(id) => self.compare_buf(id),
             PalAct::Snippet(p) => self.lib_insert(&p),
+            PalAct::LibDelete(k, n) => self.lib_delete(k, &n),
             PalAct::Macro(p) => self.lib_run_macro(&p),
             PalAct::Preset(p) => self.lib_use_preset(&p),
             PalAct::TabSize(n) => {
@@ -1728,10 +1739,8 @@ impl App {
                 self.collab_toggle();
                 changed = false;
             }
-            Cmd::TeamFolder => {
-                let cur = crate::team::team_dir().map(|d| d.display().to_string()).unwrap_or_default();
-                let title = "Team folder: a shared folder everyone can write to (empty turns team features off)";
-                self.open_palette(PalMode::Prompt(1), title, Vec::new(), &cur);
+            Cmd::TeamToggle => {
+                self.team_toggle();
                 changed = false;
             }
             Cmd::TeamName => {
@@ -1746,6 +1755,10 @@ impl App {
                 let p = b.primary();
                 let seed = if !p.is_empty() && p.hi() - p.lo() < 200 { String::from_utf8_lossy(&b.doc.text(p.lo(), p.hi())).into_owned() } else { String::new() };
                 self.open_palette(PalMode::Prompt(3), "Instant search: text in any indexed project file, or a file name", Vec::new(), seed.lines().next().unwrap_or(""));
+                changed = false;
+            }
+            Cmd::LibDelete => {
+                self.lib_delete_menu();
                 changed = false;
             }
             Cmd::LibSnippet | Cmd::LibMacro | Cmd::LibPreset | Cmd::LibFolder => {

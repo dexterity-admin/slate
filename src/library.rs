@@ -1,42 +1,213 @@
-//! The team library in `<team folder>\library`: snippets, shared macros and
-//! find / replace presets, plain files anyone can add to or edit. It is
-//! read when a command needs it, so nothing runs in the background.
+//! The team library: snippets, shared macros and find / replace presets.
+//!
+//! Every Slate keeps a full copy in `%APPDATA%\Slate\library` and the
+//! copies sync over the LAN: when two Slates meet they swap lists of what
+//! they hold (name, time changed, content hash, deleted or not) and fetch
+//! whatever the other has newer; a change made here is sent to everyone
+//! online at once. A deletion travels as a marker, so it is not undone by
+//! the next PC that still has the old copy. Files edited by hand in the
+//! folder are picked up the next time a library command runs.
 
 use crate::app::{Action, App, PalAct, PalItem, PalMode};
-use crate::edit;
 use crate::buffer::EditKind;
-use std::path::{Path, PathBuf};
+use crate::edit;
+use crate::wire::{LibMeta, Msg};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-fn lib_dir(app: &App, sub: &str) -> Option<PathBuf> {
-    Some(app.team.as_ref()?.dir.join("library").join(sub))
+pub const SNIPPET: u8 = 0;
+pub const MACRO: u8 = 1;
+pub const PRESET: u8 = 2;
+/// Deletion markers are forgotten after this long (days).
+const TOMBSTONE_DAYS: u64 = 180;
+const MAX_ITEM: usize = 4 << 20;
+
+fn folder(kind: u8) -> (&'static str, &'static str) {
+    match kind {
+        SNIPPET => ("snippets", "txt"),
+        MACRO => ("macros", "macro"),
+        _ => ("presets", "txt"),
+    }
 }
 
-/// Files of a library folder, sorted by name: (stem, path).
-fn entries(dir: &Path, ext: &str) -> Vec<(String, PathBuf)> {
-    let mut v: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && p.extension().map_or(false, |x| x.eq_ignore_ascii_case(ext)))
-                .map(|p| (p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), p))
-                .collect()
-        })
-        .unwrap_or_default();
-    v.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-    v
+pub fn lib_root() -> PathBuf {
+    crate::settings::dir().join("library")
+}
+
+fn item_path(kind: u8, name: &str) -> PathBuf {
+    let (dir, ext) = folder(kind);
+    lib_root().join(dir).join(format!("{name}.{ext}"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+pub fn hash(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf29ce484222325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100000001b3))
 }
 
 /// A file name from what the user typed.
-fn safe_name(s: &str) -> String {
-    s.trim().chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect()
+pub fn safe_name(s: &str) -> String {
+    s.trim().chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect::<String>().trim_matches('.').to_string()
+}
+
+/// Names from other PCs must be plain file names.
+fn valid_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 120 && safe_name(s) == s
+}
+
+/// Whether `a` should replace `b`: newer, or the same moment and larger hash.
+fn newer(a: &LibMeta, b: &LibMeta) -> bool {
+    (a.mtime, a.hash, a.deleted) > (b.mtime, b.hash, b.deleted)
+}
+
+/// What this PC holds, kept in `library\index.txt`.
+pub struct Store {
+    pub items: HashMap<(u8, String), LibMeta>,
+}
+
+impl Store {
+    pub fn load() -> Store {
+        let mut items = HashMap::new();
+        let t = std::fs::read_to_string(lib_root().join("index.txt")).unwrap_or_default();
+        for l in t.lines() {
+            let f: Vec<&str> = l.split('\t').collect();
+            if let [k, m, h, d, name] = f.as_slice() {
+                let (Ok(kind), Ok(mtime), Ok(hash)) = (k.parse::<u8>(), m.parse::<u64>(), u64::from_str_radix(h, 16)) else { continue };
+                if kind <= PRESET && valid_name(name) {
+                    items.insert((kind, name.to_string()), LibMeta { kind, name: name.to_string(), mtime, hash, deleted: *d == "1" });
+                }
+            }
+        }
+        Store { items }
+    }
+
+    pub fn save(&self) {
+        let mut out = String::new();
+        let mut v: Vec<&LibMeta> = self.items.values().collect();
+        v.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+        for m in v {
+            out += &format!("{}\t{}\t{:x}\t{}\t{}\n", m.kind, m.mtime, m.hash, m.deleted as u8, m.name);
+        }
+        let _ = std::fs::create_dir_all(lib_root());
+        let _ = std::fs::write(lib_root().join("index.txt"), out);
+    }
+
+    /// Brings the index in line with the folders: new or edited files get
+    /// the current time, removed ones a deletion marker. Returns what
+    /// changed.
+    pub fn scan(&mut self) -> Vec<LibMeta> {
+        let mut changed = Vec::new();
+        let now = now_ms();
+        let mut present = Vec::new();
+        for kind in [SNIPPET, MACRO, PRESET] {
+            let (dir, ext) = folder(kind);
+            let Ok(rd) = std::fs::read_dir(lib_root().join(dir)) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if !p.is_file() || !p.extension().map_or(false, |x| x.eq_ignore_ascii_case(ext)) {
+                    continue;
+                }
+                let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if !valid_name(&name) {
+                    continue;
+                }
+                let Ok(body) = std::fs::read(&p) else { continue };
+                let h = hash(&body);
+                present.push((kind, name.clone()));
+                let fresh = match self.items.get(&(kind, name.clone())) {
+                    Some(m) => m.deleted || m.hash != h,
+                    None => true,
+                };
+                if fresh {
+                    let m = LibMeta { kind, name: name.clone(), mtime: now, hash: h, deleted: false };
+                    self.items.insert((kind, name), m.clone());
+                    changed.push(m);
+                }
+            }
+        }
+        for (k, m) in self.items.iter_mut() {
+            if !m.deleted && !present.contains(k) {
+                m.deleted = true;
+                m.mtime = now;
+                m.hash = 0;
+                changed.push(m.clone());
+            }
+        }
+        // Old deletion markers can go.
+        let cutoff = now.saturating_sub(TOMBSTONE_DAYS * 86_400_000);
+        let before = self.items.len();
+        self.items.retain(|_, m| !(m.deleted && m.mtime < cutoff));
+        if !changed.is_empty() || before != self.items.len() {
+            self.save();
+        }
+        changed
+    }
+
+    /// Stores an item from another PC if it is newer. True when taken.
+    pub fn take(&mut self, meta: LibMeta, body: &[u8]) -> bool {
+        if meta.kind > PRESET || !valid_name(&meta.name) || body.len() > MAX_ITEM {
+            return false;
+        }
+        let key = (meta.kind, meta.name.clone());
+        if let Some(cur) = self.items.get(&key) {
+            if !newer(&meta, cur) {
+                return false;
+            }
+        }
+        let p = item_path(meta.kind, &meta.name);
+        if meta.deleted {
+            let _ = std::fs::remove_file(&p);
+        } else {
+            if hash(body) != meta.hash {
+                return false;
+            }
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            if std::fs::write(&p, body).is_err() {
+                return false;
+            }
+        }
+        self.items.insert(key, meta);
+        self.save();
+        true
+    }
+
+    /// Items of `kind` that exist, sorted by name.
+    pub fn list(&self, kind: u8) -> Vec<String> {
+        let mut v: Vec<String> = self.items.values().filter(|m| m.kind == kind && !m.deleted).map(|m| m.name.clone()).collect();
+        v.sort_by_key(|n| n.to_lowercase());
+        v
+    }
+}
+
+/// What `remote` lists that this store should fetch, and what it should
+/// delete straight away.
+pub fn wanted(store: &Store, remote: &[LibMeta]) -> (Vec<(u8, String)>, Vec<LibMeta>) {
+    let mut want = Vec::new();
+    let mut deletes = Vec::new();
+    for m in remote {
+        if m.kind > PRESET || !valid_name(&m.name) {
+            continue;
+        }
+        let newer_there = store.items.get(&(m.kind, m.name.clone())).map_or(true, |cur| newer(m, cur));
+        if newer_there {
+            if m.deleted {
+                deletes.push(m.clone());
+            } else {
+                want.push((m.kind, m.name.clone()));
+            }
+        }
+    }
+    (want, deletes)
 }
 
 pub fn encode_macro(m: &[Action]) -> String {
-    let mut out = String::from("# Slate macro\n");
+    let mut out = String::from("# Slate macro\r\n");
     for a in m {
         match a {
-            Action::Char(c) => out += &format!("c {}\n", *c as u32),
-            Action::Key(vk, ctrl, shift, alt) => out += &format!("k {vk} {} {} {}\n", *ctrl as u8, *shift as u8, *alt as u8),
+            Action::Char(c) => out += &format!("c {}\r\n", *c as u32),
+            Action::Key(vk, ctrl, shift, alt) => out += &format!("k {vk} {} {} {}\r\n", *ctrl as u8, *shift as u8, *alt as u8),
         }
     }
     out
@@ -56,47 +227,124 @@ pub fn decode_macro(t: &str) -> Vec<Action> {
 }
 
 impl App {
-    fn need_library(&mut self, sub: &str) -> Option<PathBuf> {
-        let d = lib_dir(self, sub);
-        if d.is_none() {
-            self.flash("The library lives in the team folder \u{2013} Team: Set Team Folder");
+    /// Re-reads the library folders and tells the others about changes.
+    pub fn lib_scan(&mut self) {
+        let changed = self.library.scan();
+        for m in changed {
+            self.lib_push(&m);
         }
-        d
     }
 
-    pub fn lib_snippets(&mut self) {
-        let Some(dir) = self.need_library("snippets") else { return };
-        let items: Vec<PalItem> = entries(&dir, "txt")
+    /// Sends one item (or its deletion) to everyone online.
+    fn lib_push(&self, m: &LibMeta) {
+        let Some(t) = &self.team else { return };
+        let body = if m.deleted { Vec::new() } else { std::fs::read(item_path(m.kind, &m.name)).unwrap_or_default() };
+        t.net.broadcast(&Msg::LibItem { meta: m.clone(), body });
+    }
+
+    pub fn lib_send_manifest(&self, to: u64) {
+        let Some(t) = &self.team else { return };
+        let items: Vec<LibMeta> = self.library.items.values().cloned().collect();
+        t.net.send(to, &Msg::LibManifest { items });
+    }
+
+    pub fn lib_on_manifest(&mut self, from: u64, items: Vec<LibMeta>) {
+        let (want, deletes) = wanted(&self.library, &items);
+        for d in deletes {
+            self.library.take(d, &[]);
+        }
+        if !want.is_empty() {
+            if let Some(t) = &self.team {
+                t.net.send(from, &Msg::LibWant { items: want });
+            }
+        }
+    }
+
+    pub fn lib_on_want(&mut self, from: u64, items: Vec<(u8, String)>) {
+        let Some(t) = &self.team else { return };
+        for (kind, name) in items.into_iter().take(10_000) {
+            let Some(m) = self.library.items.get(&(kind, name.clone())) else { continue };
+            if m.deleted {
+                continue;
+            }
+            if let Ok(body) = std::fs::read(item_path(kind, &name)) {
+                if hash(&body) == m.hash {
+                    t.net.send(from, &Msg::LibItem { meta: m.clone(), body });
+                }
+            }
+        }
+    }
+
+    pub fn lib_on_item(&mut self, meta: LibMeta, body: Vec<u8>) {
+        self.library.take(meta, &body);
+    }
+
+    /// Saves an item here and sends it to everyone.
+    fn lib_store(&mut self, kind: u8, name: &str, body: &[u8]) -> bool {
+        let p = item_path(kind, name);
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        if std::fs::write(&p, body).is_err() {
+            return false;
+        }
+        let m = LibMeta { kind, name: name.to_string(), mtime: now_ms(), hash: hash(body), deleted: false };
+        self.library.items.insert((kind, name.to_string()), m.clone());
+        self.library.save();
+        self.lib_push(&m);
+        true
+    }
+
+    fn lib_list(&mut self, kind: u8, act: fn(String) -> PalAct, title: &str, empty: &str) {
+        self.lib_scan();
+        let items: Vec<PalItem> = self
+            .library
+            .list(kind)
             .into_iter()
-            .map(|(name, p)| {
-                let first = std::fs::read_to_string(&p).ok().and_then(|t| t.lines().next().map(|l| l.trim().chars().take(60).collect())).unwrap_or_default();
-                PalItem { label: name, hint: first, act: PalAct::Snippet(p.display().to_string()) }
+            .map(|name| {
+                let hint = if kind == MACRO {
+                    String::new()
+                } else {
+                    let t = std::fs::read_to_string(item_path(kind, &name)).unwrap_or_default();
+                    if kind == PRESET {
+                        let get = |k: &str| crate::settings::parse(&t).find(|(a, _)| *a == k).map(|(_, v)| v.to_string()).unwrap_or_default();
+                        format!("{} \u{2192} {}", get("find"), get("replace"))
+                    } else {
+                        t.lines().next().map(|l| l.trim().chars().take(60).collect()).unwrap_or_default()
+                    }
+                };
+                PalItem { label: name.clone(), hint, act: act(name) }
             })
             .collect();
         if items.is_empty() {
-            return self.flash("No snippets yet \u{2013} select text and use Library: Save Selection as Snippet");
+            return self.flash(empty);
         }
-        self.open_palette(PalMode::List, "Insert snippet", items, "");
+        self.open_palette(PalMode::List, title, items, "");
     }
 
-    pub fn lib_insert(&mut self, path: &str) {
-        let Ok(raw) = std::fs::read(path) else { return self.flash("Cannot read the snippet") };
+    pub fn lib_snippets(&mut self) {
+        self.lib_list(SNIPPET, PalAct::Snippet, "Insert snippet", "No snippets yet \u{2013} select text and use Library: Save Selection as Snippet");
+    }
+
+    pub fn lib_macros(&mut self) {
+        self.lib_list(MACRO, PalAct::Macro, "Run shared macro", "No shared macros yet \u{2013} record one, then Library: Share Last Macro");
+    }
+
+    pub fn lib_presets(&mut self) {
+        self.lib_list(PRESET, PalAct::Preset, "Find / replace preset", "No presets yet \u{2013} fill in Find and Replace, then Library: Save Find / Replace as Preset");
+    }
+
+    pub fn lib_insert(&mut self, name: &str) {
+        let Ok(raw) = std::fs::read(item_path(SNIPPET, name)) else { return self.flash("Cannot read the snippet") };
         let mut text = crate::enc::decode(raw, None).text;
-        // Snippets are stored with CRLF; the buffer keeps LF inside.
+        // Stored with CRLF; the buffer keeps LF inside.
         text.retain(|&c| c != b'\r');
         let b = self.cur();
         edit::insert(b, &text, EditKind::Other);
-        self.after_lib_edit();
-    }
-
-    fn after_lib_edit(&mut self) {
         self.edited();
         self.reveal_caret();
         self.redraw();
     }
 
     pub fn lib_save_snippet(&mut self, name: &str) {
-        let Some(dir) = self.need_library("snippets") else { return };
         let b = self.cur_ref();
         let text: Vec<u8> = b.sels.iter().filter(|s| !s.is_empty()).flat_map(|s| b.doc.text(s.lo(), s.hi())).collect();
         if text.is_empty() {
@@ -106,25 +354,16 @@ impl App {
         if name.is_empty() {
             return;
         }
-        let text: Vec<u8> = String::from_utf8_lossy(&text).replace("\r\n", "\n").replace('\n', "\r\n").into_bytes();
-        let _ = std::fs::create_dir_all(&dir);
-        match std::fs::write(dir.join(format!("{name}.txt")), text) {
-            Ok(()) => self.flash(&format!("Snippet \"{name}\" saved to the team library")),
-            Err(e) => self.flash(&format!("Could not save the snippet: {e}")),
+        let text = String::from_utf8_lossy(&text).replace("\r\n", "\n").replace('\n', "\r\n").into_bytes();
+        if self.lib_store(SNIPPET, &name, &text) {
+            self.flash(&format!("Snippet \u{201C}{name}\u{201D} saved and shared with the team"));
+        } else {
+            self.flash("Could not save the snippet");
         }
     }
 
-    pub fn lib_macros(&mut self) {
-        let Some(dir) = self.need_library("macros") else { return };
-        let items: Vec<PalItem> = entries(&dir, "macro").into_iter().map(|(name, p)| PalItem { label: name, hint: String::new(), act: PalAct::Macro(p.display().to_string()) }).collect();
-        if items.is_empty() {
-            return self.flash("No shared macros yet \u{2013} record one, then Library: Share Last Macro");
-        }
-        self.open_palette(PalMode::List, "Run shared macro", items, "");
-    }
-
-    pub fn lib_run_macro(&mut self, path: &str) {
-        let Ok(t) = std::fs::read_to_string(path) else { return self.flash("Cannot read the macro") };
+    pub fn lib_run_macro(&mut self, name: &str) {
+        let Ok(t) = std::fs::read_to_string(item_path(MACRO, name)) else { return self.flash("Cannot read the macro") };
         let m = decode_macro(&t);
         if m.is_empty() {
             return self.flash("The macro is empty");
@@ -134,7 +373,6 @@ impl App {
     }
 
     pub fn lib_save_macro(&mut self, name: &str) {
-        let Some(dir) = self.need_library("macros") else { return };
         if self.last_macro.is_empty() {
             return self.flash("Record a macro first (Ctrl+Shift+R)");
         }
@@ -142,31 +380,16 @@ impl App {
         if name.is_empty() {
             return;
         }
-        let _ = std::fs::create_dir_all(&dir);
-        match std::fs::write(dir.join(format!("{name}.macro")), encode_macro(&self.last_macro)) {
-            Ok(()) => self.flash(&format!("Macro \"{name}\" shared in the team library")),
-            Err(e) => self.flash(&format!("Could not save the macro: {e}")),
+        let body = encode_macro(&self.last_macro);
+        if self.lib_store(MACRO, &name, body.as_bytes()) {
+            self.flash(&format!("Macro \u{201C}{name}\u{201D} shared with the team"));
+        } else {
+            self.flash("Could not save the macro");
         }
     }
 
-    pub fn lib_presets(&mut self) {
-        let Some(dir) = self.need_library("presets") else { return };
-        let items: Vec<PalItem> = entries(&dir, "txt")
-            .into_iter()
-            .map(|(name, p)| {
-                let t = std::fs::read_to_string(&p).unwrap_or_default();
-                let get = |k: &str| crate::settings::parse(&t).find(|(a, _)| *a == k).map(|(_, v)| v.to_string()).unwrap_or_default();
-                PalItem { label: name, hint: format!("{} \u{2192} {}", get("find"), get("replace")), act: PalAct::Preset(p.display().to_string()) }
-            })
-            .collect();
-        if items.is_empty() {
-            return self.flash("No presets yet \u{2013} fill in Find and Replace, then Library: Save Find / Replace as Preset");
-        }
-        self.open_palette(PalMode::List, "Find / replace preset", items, "");
-    }
-
-    pub fn lib_use_preset(&mut self, path: &str) {
-        let Ok(t) = std::fs::read_to_string(path) else { return self.flash("Cannot read the preset") };
+    pub fn lib_use_preset(&mut self, name: &str) {
+        let Ok(t) = std::fs::read_to_string(item_path(PRESET, name)) else { return self.flash("Cannot read the preset") };
         let get = |k: &str| crate::settings::parse(&t).find(|(a, _)| *a == k).map(|(_, v)| v.to_string()).unwrap_or_default();
         self.open_find(true, false);
         if let Some(fb) = self.find.as_mut() {
@@ -182,7 +405,6 @@ impl App {
     }
 
     pub fn lib_save_preset(&mut self, name: &str) {
-        let Some(dir) = self.need_library("presets") else { return };
         let Some(fb) = &self.find else { return self.flash("Fill in Find and Replace first (Ctrl+H)") };
         if fb.fields[0].text.is_empty() {
             return self.flash("Fill in Find and Replace first (Ctrl+H)");
@@ -200,43 +422,43 @@ impl App {
         if name.is_empty() {
             return;
         }
-        let _ = std::fs::create_dir_all(&dir);
-        match std::fs::write(dir.join(format!("{name}.txt")), text) {
-            Ok(()) => self.flash(&format!("Preset \"{name}\" saved to the team library")),
-            Err(e) => self.flash(&format!("Could not save the preset: {e}")),
+        if self.lib_store(PRESET, &name, text.as_bytes()) {
+            self.flash(&format!("Preset \u{201C}{name}\u{201D} saved and shared with the team"));
+        } else {
+            self.flash("Could not save the preset");
         }
+    }
+
+    /// Lists every item to delete one (for everyone).
+    pub fn lib_delete_menu(&mut self) {
+        self.lib_scan();
+        let mut items = Vec::new();
+        for (kind, what) in [(SNIPPET, "snippet"), (MACRO, "macro"), (PRESET, "preset")] {
+            for name in self.library.list(kind) {
+                items.push(PalItem { label: name.clone(), hint: what.into(), act: PalAct::LibDelete(kind, name) });
+            }
+        }
+        if items.is_empty() {
+            return self.flash("The library is empty");
+        }
+        self.open_palette(PalMode::List, "Delete from the team library", items, "");
+    }
+
+    pub fn lib_delete(&mut self, kind: u8, name: &str) {
+        let _ = std::fs::remove_file(item_path(kind, name));
+        let m = LibMeta { kind, name: name.to_string(), mtime: now_ms(), hash: 0, deleted: true };
+        self.library.items.insert((kind, name.to_string()), m.clone());
+        self.library.save();
+        self.lib_push(&m);
+        self.flash(&format!("\u{201C}{name}\u{201D} deleted for everyone"));
     }
 
     pub fn lib_open_folder(&mut self) {
-        let Some(dir) = self.need_library("") else { return };
-        for sub in ["snippets", "macros", "presets"] {
-            let _ = std::fs::create_dir_all(dir.join(sub));
+        let dir = lib_root();
+        for kind in [SNIPPET, MACRO, PRESET] {
+            let _ = std::fs::create_dir_all(dir.join(folder(kind).0));
         }
         let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
-    }
-
-    /// Instant search through the team index, on a worker thread; results
-    /// open like Find in Files.
-    pub fn team_search(&mut self, text: &str) {
-        let Some(team) = self.team.as_ref().map(|t| t.dir.clone()) else {
-            return self.flash("Instant search uses the team folder \u{2013} Team: Set Team Folder");
-        };
-        let pat = text.trim().to_string();
-        if pat.chars().count() < 3 {
-            return self.flash("Type at least 3 characters");
-        }
-        let q = crate::search::Query { pat, case: false, word: false, regex: false };
-        self.last_find = q.clone();
-        self.flash(&format!("Searching the team index for \u{201C}{}\u{201D}\u{2026}", q.pat));
-        let hwnd = self.hwnd.0 as isize;
-        std::thread::spawn(move || {
-            let out = crate::index::search(&team, &q);
-            let p = Box::into_raw(Box::new(out));
-            unsafe {
-                use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(HWND(hwnd as *mut _), crate::app::WM_FIF_DONE, WPARAM(0), LPARAM(p as isize));
-            }
-        });
     }
 }
 
@@ -244,11 +466,38 @@ impl App {
 mod tests {
     use super::*;
 
+    fn meta(kind: u8, name: &str, mtime: u64, hash: u64, deleted: bool) -> LibMeta {
+        LibMeta { kind, name: name.into(), mtime, hash, deleted }
+    }
+
     #[test]
     fn macro_round_trip() {
         let m = vec![Action::Char('é'), Action::Key(0x24, true, false, true), Action::Char('x')];
         let back = decode_macro(&encode_macro(&m));
         assert_eq!(format!("{back:?}"), format!("{m:?}"));
         assert_eq!(safe_name(" a/b:c "), "a_b_c");
+        assert!(!valid_name("..\\evil"));
+        assert!(!valid_name(".."));
+        assert!(valid_name("Header block"));
+    }
+
+    #[test]
+    fn newest_wins_and_deletions_travel() {
+        let mut s = Store { items: HashMap::new() };
+        s.items.insert((0, "a".into()), meta(0, "a", 10, 1, false));
+        s.items.insert((0, "b".into()), meta(0, "b", 10, 1, false));
+        let remote = vec![
+            meta(0, "a", 20, 2, false), // newer there: fetch
+            meta(0, "b", 5, 9, false),  // older there: keep ours
+            meta(0, "c", 1, 3, false),  // new to us: fetch
+            meta(1, "d", 4, 0, true),   // deleted, never had it: take the marker
+            meta(0, "../x", 99, 1, false),
+        ];
+        let (want, del) = wanted(&s, &remote);
+        assert_eq!(want, vec![(0, "a".to_string()), (0, "c".to_string())]);
+        assert_eq!(del.len(), 1);
+        // A deletion newer than our copy wins; an older one does not.
+        assert!(newer(&meta(0, "a", 30, 0, true), &meta(0, "a", 20, 2, false)));
+        assert!(!newer(&meta(0, "a", 15, 0, true), &meta(0, "a", 20, 2, false)));
     }
 }

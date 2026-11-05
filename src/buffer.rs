@@ -2,6 +2,7 @@
 //! annotations (bookmarks, folds, highlight state).
 
 use crate::doc::Doc;
+use crate::ot::Op;
 use crate::enc::{Enc, Eol};
 use crate::syntax::{self, LANGS};
 use std::path::PathBuf;
@@ -34,6 +35,8 @@ pub enum EditKind {
     Other,
 }
 
+/// One step of an edit. A group's changes are a sequence: redo applies
+/// them in order (each `at` is valid at that moment), undo in reverse.
 struct Change {
     at: usize,
     old: Vec<u8>,
@@ -44,9 +47,65 @@ struct Group {
     id: u64,
     kind: EditKind,
     changes: Vec<Change>,
+    /// Set once a co-editor's change moved this group: the whole step as an
+    /// operation on the text it applies to (the inverse for undo-stack
+    /// groups, the forward change for redo-stack ones). Replaces `changes`.
+    op: Option<Op>,
     before: Vec<Sel>,
     after: Vec<Sel>,
     time: Instant,
+}
+
+impl Group {
+    /// Undoing this group, as an operation on a text of length `len`.
+    fn inverse(&self, len: usize) -> Option<Op> {
+        if let Some(o) = &self.op {
+            return Some(o.clone());
+        }
+        let mut op: Option<Op> = None;
+        let mut l = len;
+        for c in self.changes.iter().rev() {
+            let o = Op::replace(l, c.at, c.at + c.new.len(), &c.old);
+            l = l - c.new.len() + c.old.len();
+            op = Some(match op {
+                Some(p) => p.compose(&o)?,
+                None => o,
+            });
+        }
+        Some(op.unwrap_or_else(|| Op::identity(len)))
+    }
+
+    /// Redoing this group, as an operation on a text of length `len`.
+    fn forward(&self, len: usize) -> Option<Op> {
+        if let Some(o) = &self.op {
+            return Some(o.clone());
+        }
+        let mut op: Option<Op> = None;
+        let mut l = len;
+        for c in &self.changes {
+            let o = Op::replace(l, c.at, c.at + c.old.len(), &c.new);
+            l = l - c.old.len() + c.new.len();
+            op = Some(match op {
+                Some(p) => p.compose(&o)?,
+                None => o,
+            });
+        }
+        Some(op.unwrap_or_else(|| Op::identity(len)))
+    }
+
+    fn is_noop(&self) -> bool {
+        match &self.op {
+            Some(o) => o.changes().is_empty(),
+            None => self.changes.is_empty(),
+        }
+    }
+}
+
+fn map_sels(sels: &mut [Sel], op: &Op) {
+    for s in sels.iter_mut() {
+        s.anchor = op.map_pos(s.anchor, false);
+        s.head = op.map_pos(s.head, false);
+    }
 }
 
 pub struct Buffer {
@@ -143,7 +202,7 @@ impl Buffer {
 
     /// Compare sides and files someone else locked cannot be edited.
     pub fn read_only(&self) -> bool {
-        self.diff.is_some() || self.locked_by.is_some()
+        self.diff.is_some() || self.locked_by.is_some() || self.collab.as_ref().map_or(false, |c| c.joining())
     }
 
     pub fn name(&self) -> String {
@@ -263,7 +322,7 @@ impl Buffer {
         self.redo.clear();
         let coalesce = !self.seal
             && kind == EditKind::Typing
-            && self.undo.last().map(|g| g.kind == EditKind::Typing && g.time.elapsed().as_millis() < 1500).unwrap_or(false);
+            && self.undo.last().map(|g| g.kind == EditKind::Typing && g.op.is_none() && g.time.elapsed().as_millis() < 1500).unwrap_or(false);
         if coalesce {
             let g = self.undo.last_mut().unwrap();
             g.changes.extend(recorded);
@@ -271,7 +330,7 @@ impl Buffer {
         } else {
             let id = self.next_id;
             self.next_id += 1;
-            self.undo.push(Group { id, kind, changes: recorded, before, after: Vec::new(), time: Instant::now() });
+            self.undo.push(Group { id, kind, changes: recorded, op: None, before, after: Vec::new(), time: Instant::now() });
             if self.undo.len() > 5000 {
                 self.undo.remove(0);
             }
@@ -280,13 +339,15 @@ impl Buffer {
         self.want_col = None;
     }
 
-    /// Applies a co-editor's change: no undo step, and the local undo
-    /// history is dropped because its positions no longer hold. `changes`
-    /// are ascending, in the coordinates before the change.
-    pub fn apply_remote(&mut self, changes: &[(usize, usize, Vec<u8>)]) {
-        if changes.is_empty() {
+    /// Applies a co-editor's change. It is not an undo step of ours, so the
+    /// undo and redo histories are transformed over it: undo still takes
+    /// back exactly our own edits, wherever the other person typed.
+    pub fn apply_remote(&mut self, x: &Op) {
+        let changes = x.changes();
+        if changes.is_empty() || x.base != self.doc.len() {
             return;
         }
+        self.transform_history(x);
         if let Some(c) = self.collab.as_mut() {
             c.muted = true;
         }
@@ -297,29 +358,70 @@ impl Buffer {
         if let Some(c) = self.collab.as_mut() {
             c.muted = false;
         }
-        let map = |p: usize| -> usize {
-            let mut d: isize = 0;
-            for (a, b, t) in changes {
-                // A caret where the other person typed stays before it.
-                if p <= *a {
-                    break;
-                }
-                if p < *b {
-                    return (*a as isize + d) as usize;
-                }
-                d += t.len() as isize - (*b - *a) as isize;
-            }
-            (p as isize + d) as usize
-        };
+        // A caret where the other person typed stays before their text.
         for s in self.sels.iter_mut() {
-            s.anchor = map(s.anchor);
-            s.head = map(s.head);
+            s.anchor = x.map_pos(s.anchor, false);
+            s.head = x.map_pos(s.head, false);
         }
         self.normalize();
-        self.undo.clear();
-        self.redo.clear();
         self.mark_unsaved();
         self.seal = true;
+    }
+
+    /// Moves every undo and redo step over a change made to the current
+    /// text by someone else. Undo step k applies to the text as it is after
+    /// undoing steps above it, so `x` is carried down the stack with each
+    /// transform (and likewise for redo).
+    fn transform_history(&mut self, x: &Op) {
+        for redo in [false, true] {
+            let mut cur = x.clone();
+            let mut len = self.doc.len();
+            let stack = if redo { &mut self.redo } else { &mut self.undo };
+            let mut ok = true;
+            for g in stack.iter_mut().rev() {
+                let step = if redo { g.forward(len) } else { g.inverse(len) };
+                let Some(step) = step else {
+                    ok = false;
+                    break;
+                };
+                let Some((step2, cur2)) = Op::transform(&step, &cur) else {
+                    ok = false;
+                    break;
+                };
+                // Selections: `after` lives on the text before this step is
+                // undone, `before` on the text after.
+                let (on_now, on_next) = if redo { (&mut g.before, &mut g.after) } else { (&mut g.after, &mut g.before) };
+                map_sels(on_now, &cur);
+                map_sels(on_next, &cur2);
+                len = step.target;
+                g.op = Some(step2);
+                g.changes.clear();
+                cur = cur2;
+            }
+            if !ok {
+                // Cannot happen with consistent history; never risk a wrong undo.
+                stack.clear();
+            }
+        }
+    }
+
+    /// Replaces the whole text without an undo step (joining a co-editing
+    /// session).
+    pub fn replace_all_quiet(&mut self, text: Vec<u8>) {
+        self.doc = Doc::load(text);
+        self.gen += 1;
+        self.states.clear();
+        self.folds.clear();
+        let lines = self.doc.line_count();
+        self.bookmarks.retain(|&l| l < lines);
+        self.undo.clear();
+        self.redo.clear();
+        self.normalize();
+        self.seal = true;
+        if let Some(mut g) = self.grid.take() {
+            g.reindex(&mut self.doc, 0);
+            self.grid = Some(g);
+        }
     }
 
     fn raw_replace(&mut self, at: usize, old: &[u8], new: &[u8]) {
@@ -361,11 +463,28 @@ impl Buffer {
         if self.read_only() {
             return false;
         }
+        // Steps a co-editor's change emptied (they deleted our text) are gone.
+        while self.undo.last().map_or(false, |g| g.is_noop()) {
+            self.undo.pop();
+        }
         let Some(mut g) = self.undo.pop() else { return false };
         g.after = self.sels.clone();
-        for c in g.changes.iter().rev() {
-            let new = c.new.clone();
-            self.raw_replace(c.at, &new, &c.old);
+        if let Some(inv) = g.op.take() {
+            // Redo then re-applies what this removes, lowest change first.
+            let ch = inv.changes();
+            let mut removed = Vec::with_capacity(ch.len());
+            for (a, b, t) in ch.iter().rev() {
+                let old = self.doc.text(*a, *b);
+                self.raw_replace(*a, &old, t);
+                removed.push(old);
+            }
+            removed.reverse();
+            g.changes = ch.into_iter().zip(removed).map(|((a, _, t), r)| Change { at: a, old: t, new: r }).collect();
+        } else {
+            for c in g.changes.iter().rev() {
+                let new = c.new.clone();
+                self.raw_replace(c.at, &new, &c.old);
+            }
         }
         self.sels = g.before.clone();
         self.normalize();
@@ -378,9 +497,35 @@ impl Buffer {
         if self.read_only() {
             return false;
         }
-        let Some(g) = self.redo.pop() else { return false };
-        for c in g.changes.iter() {
-            self.raw_replace(c.at, &c.old, &c.new);
+        while self.redo.last().map_or(false, |g| g.is_noop()) {
+            self.redo.pop();
+        }
+        let Some(mut g) = self.redo.pop() else { return false };
+        if let Some(fwd) = g.op.take() {
+            // As a sequence for undo: each change at its place once the
+            // lower ones are made.
+            let ch = fwd.changes();
+            let mut removed = Vec::with_capacity(ch.len());
+            for (a, b, t) in ch.iter().rev() {
+                let old = self.doc.text(*a, *b);
+                self.raw_replace(*a, &old, t);
+                removed.push(old);
+            }
+            removed.reverse();
+            let mut shift: isize = 0;
+            g.changes = ch
+                .into_iter()
+                .zip(removed)
+                .map(|((a, b, t), r)| {
+                    let at = (a as isize + shift) as usize;
+                    shift += t.len() as isize - (b - a) as isize;
+                    Change { at, old: r, new: t }
+                })
+                .collect();
+        } else {
+            for c in g.changes.iter() {
+                self.raw_replace(c.at, &c.old, &c.new);
+            }
         }
         self.sels = g.after.clone();
         self.normalize();
@@ -696,5 +841,103 @@ mod tests {
         assert_eq!(b.display_col(1), 4);
         assert_eq!(b.pos_at_col(0, 5), 2);
         assert_eq!(b.pos_at_col(0, 1), 0);
+    }
+
+    fn rnd(seed: &mut u64) -> usize {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 11) as usize
+    }
+
+    fn random_edit(b: &mut Buffer, seed: &mut u64, tag: u8) -> Op {
+        let len = b.doc.len();
+        let a = rnd(seed) % (len + 1);
+        let z = (a + rnd(seed) % 4).min(len);
+        let t = vec![tag; rnd(seed) % 3];
+        let op = Op::replace(len, a, z, &t);
+        b.seal = true;
+        b.apply(vec![(a, z, t)], EditKind::Other);
+        op
+    }
+
+    fn random_remote(text: &[u8], seed: &mut u64) -> Op {
+        let len = text.len();
+        let a = rnd(seed) % (len + 1);
+        let z = (a + rnd(seed) % 4).min(len);
+        Op::replace(len, a, z, b"#")
+    }
+
+    #[test]
+    fn undo_takes_back_only_own_edits_after_remote_changes() {
+        let mut seed = 0x1234_5678u64;
+        for _ in 0..400 {
+            let mut b = Buffer::new(1, b"PIPE
+ELBOW 90
+FLANGE
+".to_vec());
+            let t0 = b.text_all();
+            let n = 1 + rnd(&mut seed) % 5;
+            let mut lc = Op::identity(t0.len());
+            for k in 0..n {
+                let o = random_edit(&mut b, &mut seed, b'a' + k as u8);
+                lc = lc.compose(&o).unwrap();
+            }
+            let t1 = b.text_all();
+            let r = random_remote(&t1, &mut seed);
+            b.apply_remote(&r);
+            let after_remote = b.text_all();
+            for _ in 0..n {
+                b.undo();
+            }
+            let inv = lc.invert(&t0);
+            let (inv2, _) = Op::transform(&inv, &r).unwrap();
+            let expected = inv2.apply(&r.apply(&t1).unwrap()).unwrap();
+            // Where their text lands against text an undo puts back at the
+            // very same spot may differ (both are right); everything else
+            // must match exactly, and none of their text may be lost.
+            let strip = |t: &[u8]| t.iter().copied().filter(|&c| c != b'#').collect::<Vec<u8>>();
+            let got = b.text_all();
+            assert_eq!(String::from_utf8_lossy(&strip(&got)), String::from_utf8_lossy(&strip(&expected)));
+            assert_eq!(got.iter().filter(|&&c| c == b'#').count(), expected.iter().filter(|&&c| c == b'#').count());
+            for _ in 0..n {
+                b.redo();
+            }
+            assert_eq!(b.text_all(), after_remote);
+        }
+    }
+
+    #[test]
+    fn interleaved_remote_changes_keep_their_text() {
+        let mut seed = 0xBEEFu64;
+        for _ in 0..300 {
+            let mut b = Buffer::new(1, b"0123456789abcdef".to_vec());
+            let mut mine = 0;
+            for k in 0..12 {
+                if rnd(&mut seed) % 2 == 0 {
+                    random_edit(&mut b, &mut seed, b'A' + (k % 26) as u8);
+                    mine += 1;
+                } else {
+                    let t = b.text_all();
+                    let r = random_remote(&t, &mut seed);
+                    b.apply_remote(&r);
+                }
+                if rnd(&mut seed) % 4 == 0 && b.undo() {
+                    mine -= 1;
+                }
+            }
+            let before = b.text_all();
+            let mut undone = 0;
+            while b.undo() {
+                undone += 1;
+            }
+            assert!(undone <= mine + 12);
+            // None of our capital letters survive a full undo.
+            assert!(!b.text_all().iter().any(|c| c.is_ascii_uppercase()), "{}", String::from_utf8_lossy(&b.text_all()));
+            for _ in 0..undone {
+                b.redo();
+            }
+            assert_eq!(b.text_all(), before);
+        }
     }
 }

@@ -1,16 +1,18 @@
-# Drives two Slate windows side by side as two team members sharing one
-# team folder, and captures both in one screenshot.
+# Drives two Slate windows side by side as two team members on the LAN
+# (they find each other by themselves), and captures both in one screenshot.
 # Steps (separated by '|'), each for window a or b unless noted:
 #   a:c:TEXT  a:k:VK[:MODS]  a:click:X,Y      as in drive.ps1
 #   w:MS                                       wait
 #   shot:NAME                                  screenshot of both windows
 param(
     [string]$Exe = "$PSScriptRoot\..\target\release\slate.exe",
-    [Parameter(Mandatory)] [string]$TeamDir,
     [string]$ArgsA = "",
     [string]$ArgsB = "",
     [string]$NameA = "Ravi Kumar",
     [string]$NameB = "Anil Shah",
+    # Separate data folders (library, settings) per window, off C:.
+    [string]$DataA = "",
+    [string]$DataB = "",
     [string]$OutDir = "$PSScriptRoot\..\shots",
     [string]$Steps = "shot:duo",
     [int]$Width = 860,
@@ -32,17 +34,18 @@ public class DW {
 "@
 [void][DW]::SetProcessDPIAware()
 New-Item -ItemType Directory -Force $OutDir | Out-Null
-function Start-One([string]$name, [string]$extra, [int]$x) {
-    $env:SLATE_TEAM_DIR = $TeamDir
+function Start-One([string]$name, [string]$extra, [int]$x, [string]$data) {
     $env:SLATE_TEAM_NAME = $name
+    if ($data) { $env:SLATE_DATA_DIR = $data } else { Remove-Item Env:SLATE_DATA_DIR -ErrorAction SilentlyContinue }
     $p = Start-Process -FilePath $Exe -ArgumentList ("-multiInst -nosession " + $extra) -PassThru
     for ($i = 0; $i -lt 60 -and $p.MainWindowHandle -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 100; $p.Refresh() }
     [void][DW]::SetWindowPos($p.MainWindowHandle, [IntPtr](-1), $x, 40, $Width, $Height, 0)
     $p
 }
-$pa = Start-One $NameA $ArgsA 0
-$pb = Start-One $NameB $ArgsB ($Width + 8)
-Remove-Item Env:SLATE_TEAM_DIR, Env:SLATE_TEAM_NAME
+$pa = Start-One $NameA $ArgsA 0 $DataA
+$pb = Start-One $NameB $ArgsB ($Width + 8) $DataB
+Remove-Item Env:SLATE_DATA_DIR -ErrorAction SilentlyContinue
+Remove-Item Env:SLATE_TEAM_NAME
 Start-Sleep -Milliseconds 800
 function MkLp([int]$x, [int]$y) { [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF)) }
 foreach ($s in $Steps.Split('|')) {
@@ -52,7 +55,8 @@ foreach ($s in $Steps.Split('|')) {
         Start-Sleep -Milliseconds 350
         foreach ($h in $pa.MainWindowHandle, $pb.MainWindowHandle) { [void][DW]::UpdateWindow($h) }
         $ra = New-Object DW+RECT; $rb = New-Object DW+RECT
-        [void][DW]::GetWindowRect($pa.MainWindowHandle, [ref]$ra); [void][DW]::GetWindowRect($pb.MainWindowHandle, [ref]$rb)
+        $okA = [DW]::GetWindowRect($pa.MainWindowHandle, [ref]$ra); $okB = [DW]::GetWindowRect($pb.MainWindowHandle, [ref]$rb)
+        if (-not $okA) { $ra = $rb }; if (-not $okB) { $rb = $ra }
         $bw = $rb.R - $ra.L; $bh = [Math]::Max($ra.B, $rb.B) - $ra.T
         $bmp = New-Object System.Drawing.Bitmap($bw, $bh)
         $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -72,6 +76,8 @@ foreach ($s in $Steps.Split('|')) {
             $m = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
             [void][DW]::SendMessageW($hw, 0x8002, [IntPtr]$vk, [IntPtr]$m)
         }
+        'kill' { Stop-Process -Id $(if ($who -eq 'a') { $pa.Id } else { $pb.Id }) -Force }
+        'close' { [void][DW]::SendMessageW($hw, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
         'click' { $x, $y = $arg.Split(','); [void][DW]::SendMessageW($hw, 0x0201, [IntPtr]1, (MkLp $x $y)); [void][DW]::SendMessageW($hw, 0x0202, [IntPtr]0, (MkLp $x $y)) }
     }
 }

@@ -22,9 +22,9 @@ pub struct Settings {
     /// Compare ignores whitespace / letter case.
     pub cmp_ws: bool,
     pub cmp_case: bool,
-    /// Shared folder for team features (presence, locks, co-editing);
-    /// empty turns them off. Display name others see (empty: user name).
-    pub team_dir: String,
+    /// Team features over the LAN (presence, locks, co-editing, library,
+    /// search). Display name others see (empty: from Windows).
+    pub team: bool,
     pub team_name: String,
     /// Release the user chose to skip.
     pub skip_version: String,
@@ -48,7 +48,7 @@ static S: RwLock<Settings> = RwLock::new(Settings {
     csv_grid: true,
     cmp_ws: false,
     cmp_case: false,
-    team_dir: String::new(),
+    team: true,
     team_name: String::new(),
     skip_version: String::new(),
     recent: Vec::new(),
@@ -64,6 +64,10 @@ pub fn get_mut() -> RwLockWriteGuard<'static, Settings> {
 }
 
 pub fn dir() -> PathBuf {
+    // Tests run several Slates side by side, each with its own data.
+    if let Some(d) = std::env::var_os("SLATE_DATA_DIR") {
+        return PathBuf::from(d);
+    }
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     base.join("Slate")
 }
@@ -104,7 +108,7 @@ pub fn load() {
             "csv_grid" => s.csv_grid = v != "0",
             "cmp_ws" => s.cmp_ws = v == "1",
             "cmp_case" => s.cmp_case = v == "1",
-            "team_dir" => s.team_dir = v.into(),
+            "team" => s.team = v != "0",
             "team_name" => s.team_name = v.into(),
             "skip_version" => s.skip_version = v.into(),
             "recent" if !v.is_empty() => s.recent.push(v.into()),
@@ -130,7 +134,7 @@ pub fn save() {
     out += &format!("auto_update={}\nskip_version={}\n", b(s.auto_update), s.skip_version);
     out += &format!("accent={}\nanimate={}\ncsv_grid={}\n", s.accent, b(s.animate), b(s.csv_grid));
     out += &format!("cmp_ws={}\ncmp_case={}\n", b(s.cmp_ws), b(s.cmp_case));
-    out += &format!("team_dir={}\nteam_name={}\n", s.team_dir, s.team_name);
+    out += &format!("team={}\nteam_name={}\n", b(s.team), s.team_name);
     if let Some((x, y, w, h, m)) = s.win {
         out += &format!("window={x},{y},{w},{h},{}\n", m as i32);
     }

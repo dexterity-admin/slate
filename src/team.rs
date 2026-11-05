@@ -1,37 +1,17 @@
-//! Team features over a shared folder, with no server and no inbound
-//! network ports: presence (who is online and which shared files they have
-//! open), open-file warnings and edit locks.
-//!
-//! Each running Slate keeps one small text file in `<team folder>\presence`
-//! and a worker thread watches that folder for everyone else's. Paths on
-//! mapped drives are published as UNC paths so that every PC names a file
-//! the same way.
+//! Team features over direct LAN connections, with nothing to set up:
+//! presence (who is online and which files they have open), open-file
+//! warnings and edit locks. The connections themselves are in net.rs;
+//! co-editing, the library and search build on the same peers.
 
 use crate::app::{App, PalAct, PalItem, PalMode};
+use crate::net::{Event, Net, Sink};
 use crate::settings;
+use crate::wire::{Msg, PresenceFile, SessionInfo};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
-use windows::Win32::Storage::FileSystem::{
-    FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE,
-};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
-
-/// Posted by the worker with a `Box<Vec<Peer>>` in lParam.
-pub const WM_TEAM: u32 = WM_APP + 6;
-/// Own presence is rewritten this often even when nothing changed.
-const BEAT_SECS: u64 = 60;
-/// A presence file not refreshed for this long belongs to a PC that went
-/// away without closing Slate.
-const STALE_SECS: u64 = 300;
-/// Stale presence files older than this are deleted by whoever sees them.
-const PURGE_SECS: u64 = 86_400;
 
 /// Colours people are drawn in, picked from their name.
 pub const COLORS: [u32; 8] = [0x58A6FF, 0x3FB950, 0xD29922, 0xF778BA, 0xA371F7, 0x39C5CF, 0xF0883E, 0xE5534B];
@@ -44,9 +24,26 @@ pub enum FileState {
     Locked,
 }
 
+impl FileState {
+    fn code(self) -> u8 {
+        match self {
+            FileState::Open => 0,
+            FileState::Editing => 1,
+            FileState::Locked => 2,
+        }
+    }
+    fn from_code(c: u8) -> FileState {
+        match c {
+            1 => FileState::Editing,
+            2 => FileState::Locked,
+            _ => FileState::Open,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerFile {
-    /// Comparison key: the shared path in lower case.
+    /// Comparison key, see `file_key`.
     pub key: String,
     pub path: String,
     pub state: FileState,
@@ -55,14 +52,15 @@ pub struct PeerFile {
 
 #[derive(Clone, Debug)]
 pub struct Peer {
-    /// Presence file stem: unique per running Slate.
-    pub id: String,
+    pub id: u64,
     pub name: String,
     pub pc: String,
-    pub beat: u64,
+    pub version: String,
+    /// A search hub, not a person.
+    pub hub: bool,
     pub files: Vec<PeerFile>,
-    /// Co-editing sessions joined.
-    pub collab: Vec<String>,
+    /// Co-editing sessions this peer is in.
+    pub sessions: Vec<SessionInfo>,
 }
 
 impl Peer {
@@ -87,25 +85,23 @@ pub fn color_for(name: &str) -> u32 {
 }
 
 pub fn initials(name: &str) -> String {
-    let mut it = name.split_whitespace();
-    let a = it.next().and_then(|w| w.chars().next());
-    let b = it.last().and_then(|w| w.chars().next());
-    match (a, b) {
-        (Some(a), Some(b)) => format!("{}{}", a.to_uppercase(), b.to_uppercase()),
-        (Some(a), None) => {
-            let mut s: String = name.chars().take(2).collect();
-            if s.is_empty() {
-                s.push(a);
-            }
-            let mut c = s.chars();
+    let words: Vec<&str> = name.split_whitespace().collect();
+    match words.as_slice() {
+        [] => "?".into(),
+        [one] => {
+            let mut c = one.chars();
             let first = c.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-            first + &c.as_str().to_lowercase()
+            first + &c.next().map(|c| c.to_lowercase().to_string()).unwrap_or_default()
         }
-        _ => "?".into(),
+        [a, .., b] => {
+            let f = |w: &str| w.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+            f(a) + &f(b)
+        }
     }
 }
 
-/// The name shown to others: setting, else the Windows user name.
+/// The name shown to others: the optional setting, else the full name
+/// Windows knows (on a domain), else the user name.
 pub fn my_name() -> String {
     if let Ok(n) = std::env::var("SLATE_TEAM_NAME") {
         return n;
@@ -113,6 +109,15 @@ pub fn my_name() -> String {
     let s = settings::get().team_name.clone();
     if !s.trim().is_empty() {
         return s.trim().to_string();
+    }
+    use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameDisplay};
+    let mut buf = [0u16; 256];
+    let mut n = buf.len() as u32;
+    if unsafe { GetUserNameExW(NameDisplay, windows::core::PWSTR(buf.as_mut_ptr()), &mut n) }.as_bool() && n > 0 {
+        let full = String::from_utf16_lossy(&buf[..n as usize]);
+        if !full.trim().is_empty() {
+            return full.trim().to_string();
+        }
     }
     let u = std::env::var("USERNAME").unwrap_or_else(|_| "Someone".into());
     let mut c = u.chars();
@@ -122,20 +127,23 @@ pub fn my_name() -> String {
     }
 }
 
-/// Team folder: setting, or SLATE_TEAM_DIR for testing. Empty means the
-/// team features are off.
-pub fn team_dir() -> Option<PathBuf> {
-    let d = std::env::var("SLATE_TEAM_DIR").ok().unwrap_or_else(|| settings::get().team_dir.clone());
-    let d = d.trim().trim_matches('"').to_string();
-    (!d.is_empty()).then(|| PathBuf::from(d))
+pub fn my_pc() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into())
 }
 
-pub fn file_key(p: &str) -> String {
-    p.replace('/', "\\").to_lowercase()
+/// Comparison key for a file: a `\\server\share` path names the same file
+/// on every PC; any other path only on the PC that has it.
+pub fn file_key(path: &str, pc: &str) -> String {
+    let p = path.replace('/', "\\").to_lowercase();
+    if p.starts_with("\\\\") {
+        p
+    } else {
+        format!("{}|{p}", pc.to_lowercase())
+    }
 }
 
 /// The path as other PCs see it: a mapped drive letter becomes its UNC
-/// path. Local paths come back unchanged; they only match on the same PC.
+/// path. Local paths come back unchanged.
 pub fn shared_path(p: &Path) -> String {
     use windows::Win32::NetworkManagement::WNet::{WNetGetUniversalNameW, UNIVERSAL_NAME_INFOW, UNIVERSAL_NAME_INFO_LEVEL};
     let s = p.to_string_lossy().into_owned();
@@ -155,106 +163,35 @@ pub fn shared_path(p: &Path) -> String {
     }
 }
 
-pub fn render(name: &str, pc: &str, files: &[PeerFile], collab: &[String], beat: u64) -> String {
-    let mut out = format!("slate-presence 1\nname={name}\npc={pc}\nbeat={beat}\n");
-    for f in files {
-        let st = match f.state {
-            FileState::Open => "open",
-            FileState::Editing => "edit",
-            FileState::Locked => "lock",
-        };
-        out += &format!("file={st}\t{}\t{}\n", f.since, f.path);
-    }
-    for c in collab {
-        out += &format!("collab={c}\n");
-    }
-    out
-}
-
-pub fn parse(id: &str, text: &str) -> Option<Peer> {
-    let mut lines = text.lines();
-    if lines.next()? != "slate-presence 1" {
-        return None;
-    }
-    let mut p = Peer { id: id.to_string(), name: String::new(), pc: String::new(), beat: 0, files: Vec::new(), collab: Vec::new() };
-    for (k, v) in settings::parse(text) {
-        match k {
-            "name" => p.name = v.to_string(),
-            "pc" => p.pc = v.to_string(),
-            "beat" => p.beat = v.parse().unwrap_or(0),
-            "collab" => p.collab.push(v.to_string()),
-            "file" => {
-                let mut f = v.splitn(3, '\t');
-                let state = match f.next()? {
-                    "edit" => FileState::Editing,
-                    "lock" => FileState::Locked,
-                    _ => FileState::Open,
-                };
-                let since = f.next()?.parse().unwrap_or(0);
-                let path = f.next()?.to_string();
-                p.files.push(PeerFile { key: file_key(&path), path, state, since });
-            }
-            _ => {}
-        }
-    }
-    (!p.name.is_empty()).then_some(p)
-}
-
-enum Msg {
-    Publish(String),
-    Quit,
-}
-
-/// Running team connection: the worker thread and the latest snapshot.
 pub struct Team {
-    tx: mpsc::Sender<Msg>,
-    wake: isize,
-    thread: Option<std::thread::JoinHandle<()>>,
-    pub dir: PathBuf,
-    /// This Slate's presence id.
-    pub me: String,
+    pub net: Net,
+    pub me: u64,
     pub name: String,
     pub pc: String,
-    pub peers: Vec<Peer>,
-    last: RefCell<String>,
+    pub peers: HashMap<u64, Peer>,
+    started: Instant,
+    last: RefCell<Option<Msg>>,
     unc: RefCell<HashMap<PathBuf, String>>,
     /// When each own file entry started its current state.
     since: RefCell<HashMap<String, (FileState, u64)>>,
-    pub reachable: bool,
 }
 
 impl Team {
-    pub fn start(dir: PathBuf, hwnd: HWND) -> Team {
-        let pc = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into());
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-        let me = format!("{}@{}-{}", sanitize(&user), sanitize(&pc), std::process::id());
-        let (tx, rx) = mpsc::channel();
-        let wake = unsafe { CreateEventW(None, false, false, None).map(|h| h.0 as isize).unwrap_or(0) };
-        let (d, id, hw) = (dir.clone(), me.clone(), hwnd.0 as isize);
-        let thread = std::thread::spawn(move || worker(d, id, rx, wake, hw));
-        Team {
-            tx,
-            wake,
-            thread: Some(thread),
-            dir,
+    pub fn start(hwnd: windows::Win32::Foundation::HWND) -> Option<Team> {
+        let me = crate::net::new_id();
+        let (name, pc) = (my_name(), my_pc());
+        let net = Net::start(me, name.clone(), pc.clone(), false, Sink::Window(hwnd.0 as isize)).ok()?;
+        Some(Team {
+            net,
             me,
-            name: my_name(),
+            name,
             pc,
-            peers: Vec::new(),
-            last: RefCell::new(String::new()),
+            peers: HashMap::new(),
+            started: Instant::now(),
+            last: RefCell::new(None),
             unc: RefCell::new(HashMap::new()),
             since: RefCell::new(HashMap::new()),
-            reachable: true,
-        }
-    }
-
-    fn send(&self, m: Msg) {
-        let _ = self.tx.send(m);
-        if self.wake != 0 {
-            unsafe {
-                let _ = SetEvent(HANDLE(self.wake as *mut _));
-            }
-        }
+        })
     }
 
     pub fn shared(&self, p: &Path) -> String {
@@ -266,167 +203,58 @@ impl Team {
         s
     }
 
-    /// Others (not this Slate) that have the file open.
-    pub fn others_on(&self, key: &str) -> Vec<(&Peer, &PeerFile)> {
-        self.peers.iter().filter(|p| p.id != self.me).filter_map(|p| p.file(key).map(|f| (p, f))).collect()
+    pub fn key_of(&self, p: &Path) -> String {
+        file_key(&self.shared(p), &self.pc)
     }
 
-    /// Who holds the edit lock on a file: the earliest lock wins when two
+    /// People (not hubs) sorted by name.
+    pub fn people(&self) -> Vec<&Peer> {
+        let mut v: Vec<&Peer> = self.peers.values().filter(|p| !p.hub).collect();
+        v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
+        v
+    }
+
+    /// Others that have the file open.
+    pub fn others_on(&self, key: &str) -> Vec<(&Peer, &PeerFile)> {
+        self.people().into_iter().filter_map(|p| p.file(key).map(|f| (p, f))).collect()
+    }
+
+    /// Who holds the edit lock on a file; the earliest lock wins when two
     /// people locked at once. None for nobody; Some(None) for this Slate.
     pub fn lock_holder(&self, key: &str, mine: Option<u64>) -> Option<Option<&Peer>> {
-        let mut best: Option<(u64, Option<&Peer>)> = mine.map(|s| (s, None));
-        for p in self.peers.iter().filter(|p| p.id != self.me) {
+        let mut best: Option<(u64, u64, Option<&Peer>)> = mine.map(|s| (s, self.me, None));
+        for p in self.people() {
             if let Some(f) = p.file(key).filter(|f| f.state == FileState::Locked) {
-                if best.map_or(true, |(s, _)| (f.since, &p.id) < (s, &self.me)) {
-                    best = Some((f.since, Some(p)));
+                if best.map_or(true, |(s, id, _)| (f.since, p.id) < (s, id)) {
+                    best = Some((f.since, p.id, Some(p)));
                 }
             }
         }
-        best.map(|(_, p)| p)
+        best.map(|(_, _, p)| p)
     }
-}
 
-impl Drop for Team {
-    fn drop(&mut self) {
-        self.send(Msg::Quit);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-        if self.wake != 0 {
-            unsafe {
-                let _ = CloseHandle(HANDLE(self.wake as *mut _));
-            }
-        }
-    }
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
-}
-
-/// Watches the presence folder, keeps this Slate's file current and posts
-/// every change to the window. Network trouble only delays updates.
-fn worker(dir: PathBuf, id: String, rx: mpsc::Receiver<Msg>, wake: isize, hwnd: isize) {
-    let folder = dir.join("presence");
-    let mine = folder.join(format!("{id}.txt"));
-    let mut content: Option<String> = None;
-    let mut written = 0u64;
-    let mut change = HANDLE::default();
-    // (modified time, size) and parsed peer per presence file.
-    let mut seen: HashMap<String, (SystemTime, u64, Option<Peer>)> = HashMap::new();
-    let mut last_reachable = None;
-    let mut last_ids: Vec<String> = Vec::new();
-    loop {
-        if change.is_invalid() || change.0.is_null() {
-            let _ = std::fs::create_dir_all(&folder);
-            let w: Vec<u16> = folder.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
-            change = unsafe {
-                FindFirstChangeNotificationW(PCWSTR(w.as_ptr()), false, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE)
-                    .unwrap_or_default()
-            };
-            written = 0;
-        }
-        // Own file: on change, and as a heartbeat.
-        let t = now();
-        let mut quit = false;
-        while let Ok(m) = rx.try_recv() {
-            match m {
-                Msg::Publish(c) => {
-                    content = Some(c);
-                    written = 0;
-                }
-                Msg::Quit => quit = true,
-            }
-        }
-        if quit {
-            let _ = std::fs::remove_file(&mine);
-            if !change.0.is_null() && !change.is_invalid() {
-                unsafe {
-                    let _ = FindCloseChangeNotification(change);
-                }
-            }
-            return;
-        }
-        if let Some(c) = &content {
-            if t >= written + BEAT_SECS {
-                let tmp = folder.join(format!("{id}.tmp"));
-                let body = c.replace("\nbeat=0\n", &format!("\nbeat={t}\n"));
-                if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &mine).is_ok() {
-                    written = t;
-                }
-            }
-        }
-        // Everyone's files; only changed ones are read again.
-        let mut peers = Vec::new();
-        let mut reachable = false;
-        let mut changed = false;
-        if let Ok(rd) = std::fs::read_dir(&folder) {
-            reachable = true;
-            let mut present = Vec::new();
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let Some(stem) = name.strip_suffix(".txt") else { continue };
-                let Ok(md) = e.metadata() else { continue };
-                let (mt, len) = (md.modified().unwrap_or(UNIX_EPOCH), md.len());
-                present.push(stem.to_string());
-                let fresh = !matches!(seen.get(stem), Some((m, l, _)) if *m == mt && *l == len);
-                if fresh {
-                    let p = std::fs::read_to_string(e.path()).ok().and_then(|txt| parse(stem, &txt));
-                    seen.insert(stem.to_string(), (mt, len, p));
-                    changed = true;
-                }
-                if let Some((_, _, Some(p))) = seen.get(stem) {
-                    let age = t.abs_diff(p.beat);
-                    if age > PURGE_SECS && stem != id {
-                        let _ = std::fs::remove_file(e.path());
-                    } else if age <= STALE_SECS || stem == id {
-                        peers.push(p.clone());
-                    }
-                }
-            }
-            let n = seen.len();
-            seen.retain(|k, _| present.contains(k));
-            changed |= seen.len() != n;
-        }
-        peers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
-        // Post only when a presence file changed, someone went stale, or the
-        // folder came or went.
-        let ids: Vec<String> = peers.iter().map(|p| p.id.clone()).collect();
-        if changed || ids != last_ids || last_reachable != Some(reachable) {
-            last_reachable = Some(reachable);
-            last_ids = ids;
-            let p = Box::into_raw(Box::new((reachable, peers)));
-            unsafe {
-                if PostMessageW(HWND(hwnd as *mut _), WM_TEAM, WPARAM(0), LPARAM(p as isize)).is_err() {
-                    drop(Box::from_raw(p));
-                }
-            }
-        }
-        // Sleep until the folder changes, a publish arrives or the next beat.
-        let handles: Vec<HANDLE> = [HANDLE(wake as *mut _), change].into_iter().filter(|h| !h.0.is_null() && !h.is_invalid()).collect();
-        let timeout = if change.0.is_null() || change.is_invalid() { 15_000 } else { (BEAT_SECS * 1000 / 2) as u32 };
-        let r = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
-        if handles.len() == 2 && r.0 == 1 {
-            unsafe {
-                if FindNextChangeNotification(change).is_err() {
-                    let _ = FindCloseChangeNotification(change);
-                    change = HANDLE::default();
-                }
-            }
-        }
+    pub fn hubs(&self) -> Vec<&Peer> {
+        let mut v: Vec<&Peer> = self.peers.values().filter(|p| p.hub).collect();
+        v.sort_by_key(|p| p.id);
+        v
     }
 }
 
 impl App {
     pub fn team_start(&mut self) {
-        self.team = team_dir().map(|d| Team::start(d, self.hwnd));
+        if !settings::get().team {
+            self.team = None;
+            return;
+        }
+        self.team = Team::start(self.hwnd);
+        self.lib_scan();
         self.team_publish();
     }
 
-    /// Sends this Slate's open files to the others when they changed.
-    pub fn team_publish(&self) {
-        let Some(t) = &self.team else { return };
-        let mut files: Vec<PeerFile> = Vec::new();
+    /// The presence message for this Slate's open files and sessions.
+    fn presence(&self) -> Option<Msg> {
+        let t = self.team.as_ref()?;
+        let mut files: Vec<PresenceFile> = Vec::new();
         let mut since = t.since.borrow_mut();
         let mut keep = Vec::new();
         for b in &self.bufs {
@@ -435,7 +263,7 @@ impl App {
                 continue;
             }
             let path = t.shared(p);
-            let key = file_key(&path);
+            let key = file_key(&path, &t.pc);
             let state = if b.lock_since.is_some() {
                 FileState::Locked
             } else if b.dirty() {
@@ -448,42 +276,96 @@ impl App {
                 _ => b.lock_since.unwrap_or_else(now),
             };
             since.insert(key.clone(), (state, s));
-            keep.push(key.clone());
-            if !files.iter().any(|f| f.key == key) {
-                files.push(PeerFile { key, path, state, since: s });
+            if !keep.contains(&key) {
+                keep.push(key);
+                files.push(PresenceFile { path, state: state.code(), since: s });
             }
         }
         since.retain(|k, _| keep.contains(k));
         drop(since);
-        let collab = self.collab_ids();
-        // "beat=0" is replaced with the time by the worker on each write.
-        let text = render(&t.name, &t.pc, &files, &collab, 0);
-        if *t.last.borrow() != text {
-            *t.last.borrow_mut() = text.clone();
-            t.send(Msg::Publish(text));
+        Some(Msg::Presence { files, sessions: self.collab_sessions() })
+    }
+
+    /// Tells the others when this Slate's files or sessions changed.
+    pub fn team_publish(&self) {
+        let Some(m) = self.presence() else { return };
+        let t = self.team.as_ref().unwrap();
+        if t.last.borrow().as_ref() != Some(&m) {
+            t.net.broadcast(&m);
+            *t.last.borrow_mut() = Some(m);
         }
     }
 
-    pub fn on_team(&mut self, reachable: bool, peers: Vec<Peer>) {
-        let Some(t) = self.team.as_mut() else { return };
-        let was = t.reachable;
-        t.reachable = reachable;
-        let before: Vec<String> = t.peers.iter().filter(|p| p.id != t.me).map(|p| p.name.clone()).collect();
-        t.peers = peers;
-        if was && !reachable {
-            self.flash("The team folder cannot be reached \u{2013} team features pause until it is back");
+    pub fn on_net(&mut self, e: Event) {
+        if self.team.is_none() {
+            return;
         }
-        // Someone came online: a quiet note.
-        if let Some(t) = &self.team {
-            let joined: Vec<&Peer> = t.peers.iter().filter(|p| p.id != t.me && !before.contains(&p.name)).collect();
-            if joined.len() == 1 && !before.is_empty() {
-                let msg = format!("{} is online", joined[0].name);
-                self.flash(&msg);
+        match e {
+            Event::Up { id, name, pc, version, hub } => {
+                let t = self.team.as_mut().unwrap();
+                let quiet = t.started.elapsed().as_secs() < 8 || hub || name == t.name;
+                t.peers.insert(id, Peer { id, name: name.clone(), pc, version, hub, files: Vec::new(), sessions: Vec::new() });
+                // Bring the newcomer up to date.
+                if let Some(m) = t.last.borrow().clone() {
+                    t.net.send(id, &m);
+                }
+                self.lib_send_manifest(id);
+                self.collab_peer_up(id);
+                if !quiet {
+                    self.flash(&format!("{name} is online"));
+                }
+            }
+            Event::Down { id } => {
+                self.team.as_mut().unwrap().peers.remove(&id);
+                self.collab_peer_down(id);
+            }
+            Event::Msg { from, msg } => {
+                let t = self.team.as_mut().unwrap();
+                let Some(p) = t.peers.get_mut(&from) else { return };
+                match msg {
+                    Msg::Presence { files, sessions } => {
+                        let pc = p.pc.clone();
+                        p.files = files.into_iter().map(|f| PeerFile { key: file_key(&f.path, &pc), path: f.path, state: FileState::from_code(f.state), since: f.since }).collect();
+                        p.sessions = sessions;
+                        self.collab_on_presence(from);
+                    }
+                    Msg::LibManifest { items } => self.lib_on_manifest(from, items),
+                    Msg::LibWant { items } => self.lib_on_want(from, items),
+                    Msg::LibItem { meta, body } => self.lib_on_item(meta, body),
+                    Msg::SearchRes { qid, text } => self.search_result(qid, text),
+                    Msg::SearchReq { .. } | Msg::Hello { .. } => {}
+                    m => self.collab_on_msg(from, m),
+                }
             }
         }
         self.team_apply_locks();
-        self.collab_on_team();
         self.redraw();
+    }
+
+    /// Instant search: asks the search hub on the network.
+    pub fn team_search(&mut self, text: &str) {
+        let pat = text.trim().to_string();
+        if pat.chars().count() < 3 {
+            return self.flash("Type at least 3 characters");
+        }
+        let Some(t) = &self.team else {
+            return self.flash("Team features are off \u{2013} Settings: Toggle Team Features");
+        };
+        let Some(hub) = t.hubs().first().map(|h| h.id) else {
+            return self.flash("No search hub is running on the network \u{2013} Find in Files (Ctrl+Shift+F) searches a folder directly");
+        };
+        let qid = crate::net::new_id();
+        t.net.send(hub, &Msg::SearchReq { qid, query: pat.clone() });
+        self.search_qid = Some(qid);
+        self.last_find = crate::search::Query { pat: pat.clone(), case: false, word: false, regex: false };
+        self.flash(&format!("Searching for \u{201C}{pat}\u{201D}\u{2026}"));
+    }
+
+    pub fn search_result(&mut self, qid: u64, text: String) {
+        if self.search_qid == Some(qid) {
+            self.search_qid = None;
+            self.fif_done(text);
+        }
     }
 
     /// Marks buffers locked by someone else read-only (and back).
@@ -496,12 +378,9 @@ impl App {
         };
         let mut changes = Vec::new();
         for (i, b) in self.bufs.iter().enumerate() {
-            let holder = b.path.as_ref().and_then(|p| {
-                let key = file_key(&t.shared(p));
-                match t.lock_holder(&key, b.lock_since) {
-                    Some(Some(peer)) => Some(peer.name.clone()),
-                    _ => None,
-                }
+            let holder = b.path.as_ref().and_then(|p| match t.lock_holder(&t.key_of(p), b.lock_since) {
+                Some(Some(peer)) => Some(peer.name.clone()),
+                _ => None,
             });
             if holder != b.locked_by {
                 changes.push((i, holder));
@@ -517,24 +396,25 @@ impl App {
         }
     }
 
-    /// People (other than this Slate) with the buffer's file open.
+    /// People with the buffer's file open: (name, colour, state).
     pub fn team_others(&self, bi: usize) -> Vec<(String, u32, FileState)> {
         let (Some(t), Some(p)) = (&self.team, &self.bufs[bi].path) else { return Vec::new() };
-        let key = file_key(&t.shared(p));
-        t.others_on(&key).into_iter().map(|(p, f)| (p.name.clone(), p.color(), f.state)).collect()
+        t.others_on(&t.key_of(p)).into_iter().map(|(p, f)| (p.name.clone(), p.color(), f.state)).collect()
     }
 
     /// Note shown when a file opens that others are working on.
     pub fn team_on_open(&mut self, id: u32) {
         let bi = self.bi(id);
-        let others = self.team_others(bi);
-        if let Some(by) = &self.bufs[bi].locked_by {
-            let msg = format!("Locked by {by} \u{2013} opened read-only");
-            return self.flash(&msg);
+        if let Some(by) = self.bufs[bi].locked_by.clone() {
+            return self.flash(&format!("Locked by {by} \u{2013} opened read-only"));
         }
+        if let Some(who) = self.collab_offer_for(bi) {
+            return self.flash(&format!("{who} co-editing this file \u{2013} Ctrl+Shift+E joins"));
+        }
+        let others = self.team_others(bi);
         let editing: Vec<&str> = others.iter().filter(|o| o.2 == FileState::Editing).map(|o| o.0.as_str()).collect();
         if !editing.is_empty() {
-            let msg = format!("{} {} unsaved changes in this file \u{2013} Team: Co-edit avoids overwriting each other", join_names(&editing), if editing.len() == 1 { "has" } else { "have" });
+            let msg = format!("{} {} unsaved changes in this file \u{2013} Ctrl+Shift+E co-edits it instead", join_names(&editing), if editing.len() == 1 { "has" } else { "have" });
             self.flash(&msg);
         } else if !others.is_empty() {
             let names: Vec<&str> = others.iter().map(|o| o.0.as_str()).collect();
@@ -545,6 +425,9 @@ impl App {
 
     /// Warns once when you start changing a file someone else is changing.
     pub fn team_on_edit(&mut self) {
+        if self.views[self.av].tabs.is_empty() {
+            return;
+        }
         let bi = self.bi(self.tab(self.av).buf);
         if self.bufs[bi].team_warned || !self.bufs[bi].dirty() || self.bufs[bi].collab.is_some() {
             return;
@@ -553,22 +436,24 @@ impl App {
         let editing: Vec<&str> = others.iter().filter(|o| o.2 == FileState::Editing).map(|o| o.0.as_str()).collect();
         if !editing.is_empty() {
             self.bufs[bi].team_warned = true;
-            let msg = format!("Careful: {} also {} unsaved changes here \u{2013} the last save wins. Team: Co-edit works on it together", join_names(&editing), if editing.len() == 1 { "has" } else { "have" });
+            let msg = format!("Careful: {} also {} unsaved changes here \u{2013} the last save wins. Ctrl+Shift+E co-edits it together", join_names(&editing), if editing.len() == 1 { "has" } else { "have" });
             self.flash(&msg);
         }
     }
 
     pub fn team_toggle_lock(&mut self) {
         if self.team.is_none() {
-            return self.flash("Set a team folder first \u{2013} Team: Set Team Folder");
+            return self.flash("Team features are off \u{2013} Settings: Toggle Team Features");
         }
         let bi = self.bi(self.tab(self.av).buf);
         if self.bufs[bi].path.is_none() {
-            return self.flash("Save the file to the shared folder first");
+            return self.flash("Save the file first");
         }
-        if let Some(by) = &self.bufs[bi].locked_by {
-            let msg = format!("{by} holds the lock on this file");
-            return self.flash(&msg);
+        if self.bufs[bi].collab.is_some() {
+            return self.flash("A co-edited file cannot be locked");
+        }
+        if let Some(by) = self.bufs[bi].locked_by.clone() {
+            return self.flash(&format!("{by} holds the lock on this file"));
         }
         let on = self.bufs[bi].lock_since.is_none();
         self.bufs[bi].lock_since = on.then(now);
@@ -579,16 +464,18 @@ impl App {
     /// Who's online, and what they have open.
     pub fn team_people(&mut self) {
         let Some(t) = &self.team else {
-            return self.flash("Team features are off \u{2013} Team: Set Team Folder turns them on");
+            return self.flash("Team features are off \u{2013} Settings: Toggle Team Features turns them on");
         };
         let mut items = Vec::new();
-        for p in t.peers.iter().filter(|p| p.id != t.me) {
+        for p in t.people() {
             let summary = match p.files.len() {
                 0 => "online".to_string(),
                 1 => "1 file open".to_string(),
                 n => format!("{n} files open"),
             };
-            items.push(PalItem { label: p.name.clone(), hint: format!("{} \u{B7} {summary}", p.pc), act: PalAct::Cmd(crate::app::Cmd::TeamPeople) });
+            // Say so when someone runs another version of Slate.
+            let ver = if p.version != env!("CARGO_PKG_VERSION") { format!(" \u{B7} Slate {}", p.version) } else { String::new() };
+            items.push(PalItem { label: p.name.clone(), hint: format!("{} \u{B7} {summary}{ver}", p.pc), act: PalAct::Cmd(crate::app::Cmd::TeamPeople) });
             for f in &p.files {
                 let st = match f.state {
                     FileState::Open => "",
@@ -597,36 +484,44 @@ impl App {
                 };
                 let name = Path::new(&f.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let dir = Path::new(&f.path).parent().map(|d| d.display().to_string()).unwrap_or_default();
-                items.push(PalItem { label: format!("      {name}"), hint: format!("{st}{dir}"), act: PalAct::Open(f.path.clone()) });
+                // Another PC's local file cannot be opened from here.
+                let act = if f.path.starts_with("\\\\") || p.pc.eq_ignore_ascii_case(&t.pc) { PalAct::Open(f.path.clone()) } else { PalAct::Cmd(crate::app::Cmd::TeamPeople) };
+                items.push(PalItem { label: format!("      {name}"), hint: format!("{st}{dir}"), act });
             }
         }
-        let n = t.peers.iter().filter(|p| p.id != t.me).count();
+        for h in t.hubs() {
+            items.push(PalItem { label: "Search hub".into(), hint: h.pc.clone(), act: PalAct::Cmd(crate::app::Cmd::TeamSearch) });
+        }
+        let n = t.people().len();
         let title = if n == 0 { "Nobody else is online".to_string() } else { format!("{n} online \u{2013} pick a file to open it") };
         self.open_palette(PalMode::List, &title, items, "");
-    }
-
-    pub fn team_set_folder(&mut self, text: &str) {
-        let text = text.trim().trim_matches('"').to_string();
-        if !text.is_empty() && !Path::new(&text).is_dir() {
-            return self.flash(&format!("Folder not found: {text}"));
-        }
-        settings::get_mut().team_dir = text.clone();
-        settings::save();
-        self.team = None;
-        self.team_start();
-        self.flash(if text.is_empty() { "Team features are off" } else { "Team folder set \u{2013} others using the same folder now see you online" });
-        self.redraw();
     }
 
     pub fn team_set_name(&mut self, text: &str) {
         settings::get_mut().team_name = text.trim().to_string();
         settings::save();
-        if let Some(t) = self.team.as_mut() {
-            t.name = my_name();
-            t.last.borrow_mut().clear();
+        self.flash(&format!("Others see you as {} after Slate restarts", my_name()));
+    }
+
+    pub fn team_toggle(&mut self) {
+        let on = {
+            let mut s = settings::get_mut();
+            s.team = !s.team;
+            s.team
+        };
+        settings::save();
+        if on {
+            self.team_start();
+        } else {
+            for b in self.bufs.iter_mut() {
+                b.collab = None;
+                b.locked_by = None;
+                b.lock_since = None;
+            }
+            self.team = None;
         }
-        self.team_publish();
-        self.flash(&format!("Others see you as {}", my_name()));
+        self.flash(if on { "Team features on" } else { "Team features off: Slate no longer talks to other PCs" });
+        self.redraw();
     }
 
     /// Status-bar menu for the current file: co-edit, lock, who is here.
@@ -634,8 +529,8 @@ impl App {
         let bi = self.bi(self.tab(self.av).buf);
         let b = &self.bufs[bi];
         let mut items = Vec::new();
-        let cmd = |c| PalAct::Cmd(c);
         use crate::app::Cmd;
+        let cmd = PalAct::Cmd;
         if b.collab.is_some() {
             items.push(PalItem { label: "Leave co-editing".into(), hint: "Ctrl+Shift+E".into(), act: cmd(Cmd::CoEdit) });
         } else if b.locked_by.is_none() {
@@ -680,7 +575,7 @@ impl App {
         let Some(t) = &self.team else { return Vec::new() };
         let mut seen: Vec<String> = Vec::new();
         let mut out = Vec::new();
-        for p in t.peers.iter().filter(|p| p.id != t.me) {
+        for p in t.people() {
             // One avatar per person, even with several Slate windows; your
             // own other windows are not "someone online".
             if seen.contains(&p.name) || (p.name == t.name && p.pc == t.pc) {
@@ -707,25 +602,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn presence_round_trip() {
-        let files = vec![
-            PeerFile { key: String::new(), path: r"\\srv\proj\P-101.pcf".into(), state: FileState::Editing, since: 5 },
-            PeerFile { key: String::new(), path: r"\\srv\proj\list.csv".into(), state: FileState::Locked, since: 9 },
-        ];
-        let t = render("Ravi Kumar", "DDS-07", &files, &["abc".into()], 42);
-        let p = parse("r@pc-1", &t).unwrap();
-        assert_eq!((p.name.as_str(), p.pc.as_str(), p.beat), ("Ravi Kumar", "DDS-07", 42));
-        assert_eq!(p.files.len(), 2);
-        assert_eq!(p.files[0].key, r"\\srv\proj\p-101.pcf");
-        assert_eq!(p.files[1].state, FileState::Locked);
-        assert_eq!(p.collab, vec!["abc".to_string()]);
-        assert!(parse("x", "garbage").is_none());
-    }
-
-    #[test]
-    fn names() {
+    fn names_and_keys() {
         assert_eq!(initials("Ravi Kumar"), "RK");
+        assert_eq!(initials("Ravi Kumar Shah"), "RS");
         assert_eq!(initials("vikram"), "Vi");
         assert_eq!(join_names(&["A", "B", "C", "D"]), "A, B and 2 others");
+        assert_eq!(file_key(r"\\Srv\P\A.pcf", "PC1"), r"\\srv\p\a.pcf");
+        assert_eq!(file_key(r"D:\x\A.pcf", "PC1"), r"pc1|d:\x\a.pcf");
+        assert_ne!(file_key(r"D:\x\A.pcf", "PC1"), file_key(r"D:\x\A.pcf", "PC2"));
     }
 }

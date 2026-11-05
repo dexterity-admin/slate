@@ -15,6 +15,7 @@ mod gfx;
 mod icons;
 mod index;
 mod library;
+mod net;
 mod input;
 mod paint;
 mod search;
@@ -23,6 +24,7 @@ mod ot;
 mod syntax;
 mod sys;
 mod team;
+mod wire;
 mod ui;
 mod update;
 mod updater_ui;
@@ -280,6 +282,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             T_BACKUP => a.write_backups(),
             app::T_LOAD | app::T_ANIM => a.redraw(),
             grid::T_FILTER => a.on_filter_timer(),
+            collab::T_COLLAB => a.collab_tick(),
             updater_ui::T_UPDATE => a.on_update_timer(),
             updater_ui::T_HANDSHAKE => a.on_handshake_timer(),
             updater_ui::T_CLEANUP => a.on_cleanup_timer(),
@@ -328,14 +331,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let l = Box::from_raw(lp.0 as *mut app::Loaded);
             a.on_loaded(*l);
         }
-        team::WM_TEAM => {
-            let t = Box::from_raw(lp.0 as *mut (bool, Vec<team::Peer>));
-            let (reachable, peers) = *t;
-            a.on_team(reachable, peers);
-        }
-        collab::WM_COLLAB => {
-            let inc = Box::from_raw(lp.0 as *mut collab::Incoming);
-            a.on_collab(*inc);
+        net::WM_NET => {
+            let e = Box::from_raw(lp.0 as *mut net::Event);
+            a.on_net(*e);
         }
         WM_TEST_KEY => {
             a.on_key(wp.0 as u32, lp.0 & 1 != 0, lp.0 & 2 != 0, lp.0 & 4 != 0);
@@ -413,7 +411,8 @@ fn main() {
     // Headless search hub: keeps the team's search index current.
     if args.iter().any(|a| a == "--hub") {
         settings::load();
-        std::process::exit(index::hub_main(args.iter().any(|a| a == "--once")));
+        let rest: Vec<String> = args.iter().filter(|a| *a != "--hub").cloned().collect();
+        std::process::exit(index::hub_main(&rest));
     }
     let mut files = Vec::new();
     let mut bench_ms = 0u32;

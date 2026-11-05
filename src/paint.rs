@@ -147,7 +147,7 @@ impl App {
                 g.fill_alpha(rc.x, rc.y, rc.w, rc.h, 6.0, C::Hover, ha);
             }
             let online = self.team_online();
-            let reachable = self.team.as_ref().map_or(false, |t| t.reachable);
+            let reachable = self.team.is_some();
             let me = crate::team::my_name();
             let y = rc.y + 2.0;
             let mut x = rc.x + 6.0;
@@ -355,6 +355,8 @@ impl App {
 
         self.gfx.clip(vx, ty, vw, th);
         let mut line_buf = Vec::new();
+        // Co-editors' carets and selections: (anchor, head, name, colour).
+        let remote = self.collab_carets(bi);
         for row in &rows {
             let b = &self.bufs[bi];
             let Some(l) = self.cache.get(&row.key) else { continue };
@@ -385,6 +387,14 @@ impl App {
                     let (ex, ey) = self.end_xy(l);
                     self.gfx.fill(ox + ex, row.y + ey, self.gfx.char_w * 0.6, lh, fill);
                 }
+            }
+            // Co-editors' selections, in their colours.
+            for (a, h, _, rgb) in &remote {
+                let (lo, hi) = (*a.min(h), *a.max(h));
+                if lo == hi || hi < ls || lo > le {
+                    continue;
+                }
+                self.fill_range_tint(l, lo.max(ls) - ls, hi.min(le) - ls, ox, row.y, *rgb, if self.gfx.dark { 0.30 } else { 0.22 });
             }
             // Search / same-word marks.
             if let Some(m) = &marker {
@@ -453,7 +463,7 @@ impl App {
             }
         }
         // Co-editors' carets, with their names.
-        for (pos, name, rgb) in self.collab_carets(bi) {
+        for (_, pos, name, rgb) in remote {
             let line = self.bufs[bi].doc.line_of(pos);
             let Some(row) = rows.iter().find(|r| r.line == line) else { continue };
             let (x, y) = self.pos_xy(bi, line, pos, wrap);
@@ -597,10 +607,10 @@ impl App {
                 segs.push(("OVR".into(), 7));
             }
             if let Some(c) = &b.collab {
-                let people = self.collab_people(&c.sid);
-                let who: Vec<&str> = people.iter().map(|s| s.as_str()).collect();
-                let text = if who.is_empty() { "Co-editing \u{2013} waiting for others".to_string() } else { format!("Co-editing with {}", crate::team::join_names(&who)) };
-                segs.push((text, 13));
+                let _ = c;
+                if let Some(text) = self.collab_status(self.bi(b.id)) {
+                    segs.push((text, 13));
+                }
             } else if let Some(t) = self.team_status() {
                 segs.push((t, 12));
             }

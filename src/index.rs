@@ -1,11 +1,10 @@
 //! Office-wide instant search: a trigram index of the project folders.
 //!
-//! One always-on PC runs `slate.exe --hub`, which walks the folders listed
-//! in `<team folder>\index\roots.txt` and keeps `<team folder>\index\
-//! search.idx` current, re-reading only files that changed. Every Slate
-//! answers a search by intersecting the posting lists of the query's
-//! trigrams and checking just those candidate files, instead of reading
-//! the whole share.
+//! One always-on PC runs `slate.exe --hub <folders>`: it keeps an index of
+//! those folders on its own disk, re-reading only files that changed, and
+//! answers searches sent by any Slate on the LAN. A search intersects the
+//! posting lists of the query's trigrams and checks just those candidate
+//! files, instead of reading the whole share.
 
 use crate::search::Query;
 use std::collections::HashMap;
@@ -240,13 +239,18 @@ impl Index {
     }
 }
 
-pub fn index_dir(team: &Path) -> PathBuf {
-    team.join("index")
+/// Where a hub keeps its index (on the hub PC itself).
+pub fn index_dir() -> PathBuf {
+    crate::settings::dir().join("index")
 }
 
-/// Folders to index, one per line in roots.txt (`#` starts a comment).
-pub fn roots(team: &Path) -> Vec<PathBuf> {
-    let t = std::fs::read_to_string(index_dir(team).join("roots.txt")).unwrap_or_default();
+fn folders_file() -> PathBuf {
+    index_dir().join("folders.txt")
+}
+
+/// Folders the hub indexes, one per line (`#` starts a comment).
+pub fn roots() -> Vec<PathBuf> {
+    let t = std::fs::read_to_string(folders_file()).unwrap_or_default();
     // Notepad may save it with a byte-order mark.
     let t = t.trim_start_matches('\u{FEFF}');
     t.lines().map(|l| l.trim().trim_matches('"')).filter(|l| !l.is_empty() && !l.starts_with('#')).map(PathBuf::from).collect()
@@ -268,22 +272,14 @@ fn text_of(p: &Path) -> Option<Vec<u8>> {
     Some(if wide { crate::enc::decode(raw, None).text } else { raw })
 }
 
-/// One indexing pass; returns a status line.
-pub fn build(team: &Path, log: &mut dyn FnMut(&str)) -> std::io::Result<String> {
-    let dir = index_dir(team);
-    std::fs::create_dir_all(&dir)?;
-    let idx_path = dir.join("search.idx");
-    let roots = roots(team);
-    if roots.is_empty() {
-        let note = dir.join("roots.txt");
-        if !note.exists() {
-            std::fs::write(&note, "# Folders to index for instant search, one per line, e.g.\n# \\\\server\\projects\\P12513\n")?;
-        }
-        return Ok(format!("No folders listed in {}", note.display()));
+/// One indexing pass over `roots` into `idx_path`; returns a status line.
+pub fn build(roots: &[PathBuf], idx_path: &Path, log: &mut dyn FnMut(&str)) -> std::io::Result<String> {
+    if let Some(d) = idx_path.parent() {
+        std::fs::create_dir_all(d)?;
     }
     // What the last pass knew, to skip unchanged files.
     let mut old: HashMap<String, (u64, u64, bool, Vec<u32>)> = HashMap::new();
-    if let Ok(mut ix) = Index::open(&idx_path) {
+    if let Ok(mut ix) = Index::open(idx_path) {
         let sets = ix.file_sets();
         for (f, s) in ix.files.into_iter().zip(sets) {
             old.insert(f.path, (f.size, f.mtime, f.indexed, s));
@@ -294,8 +290,9 @@ pub fn build(team: &Path, log: &mut dyn FnMut(&str)) -> std::io::Result<String> 
     let mut sets = Vec::new();
     let (mut read, mut reused) = (0usize, 0usize);
     let mut tris = Vec::new();
-    for root in &roots {
-        let mut stack = vec![root.clone()];
+    for root in roots {
+        // Results name files the way every PC can open them.
+        let mut stack = vec![PathBuf::from(crate::team::shared_path(root))];
         while let Some(d) = stack.pop() {
             let Ok(rd) = std::fs::read_dir(&d) else { continue };
             for e in rd.flatten() {
@@ -333,53 +330,79 @@ pub fn build(team: &Path, log: &mut dyn FnMut(&str)) -> std::io::Result<String> 
             }
         }
     }
-    write_index(&idx_path, crate::team::now(), &files, &sets)?;
-    Ok(format!(
-        "Indexed {} files ({} read, {} unchanged) in {:.1} s",
-        files.len(),
-        read,
-        reused,
-        t0.elapsed().as_secs_f32()
-    ))
+    write_index(idx_path, crate::team::now(), &files, &sets)?;
+    Ok(format!("Indexed {} files ({} read, {} unchanged) in {:.1} s", files.len(), read, reused, t0.elapsed().as_secs_f32()))
 }
 
-/// `slate.exe --hub [--once]`: keeps the index current, every 10 minutes.
-pub fn hub_main(once: bool) -> i32 {
-    let Some(team) = crate::team::team_dir() else { return 2 };
-    let dir = index_dir(&team);
-    let _ = std::fs::create_dir_all(&dir);
-    // Only one hub per team folder: hold hub.lock open exclusively.
-    use std::os::windows::fs::OpenOptionsExt;
-    let Ok(_lock) = std::fs::OpenOptions::new().write(true).create(true).share_mode(0).open(dir.join("hub.lock")) else { return 3 };
-    let status = dir.join("hub.txt");
-    loop {
-        let mut log = |s: &str| {
-            let _ = std::fs::write(&status, format!("running: {s}\n"));
-        };
-        let line = match build(&team, &mut log) {
-            Ok(s) => s,
-            Err(e) => format!("error: {e}"),
-        };
-        let _ = std::fs::write(&status, format!("{line}\nat={}\n", crate::team::now()));
-        if once {
-            return 0;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(600));
+/// `slate.exe --hub [folder ...] [--once]`: indexes the folders (given
+/// here, or remembered from last time) every 10 minutes and answers
+/// searches from every Slate on the network. No window.
+pub fn hub_main(args: &[String]) -> i32 {
+    use crate::net::{Event, Net, Sink};
+    use crate::wire::Msg;
+    use std::sync::{mpsc, Arc};
+    let once = args.iter().any(|a| a == "--once");
+    let given: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
+    let _ = std::fs::create_dir_all(index_dir());
+    if !given.is_empty() {
+        let _ = std::fs::write(folders_file(), given.join("\r\n") + "\r\n");
     }
+    let status = index_dir().join("hub.txt");
+    let roots = roots();
+    if roots.is_empty() {
+        let _ = std::fs::write(&status, "No folders to index: run slate.exe --hub <folder> [<folder> ...]\r\n");
+        return 2;
+    }
+    // Only one hub per PC.
+    use std::os::windows::fs::OpenOptionsExt;
+    let Ok(_lock) = std::fs::OpenOptions::new().write(true).create(true).share_mode(0).open(index_dir().join("hub.lock")) else { return 3 };
+    let idx = index_dir().join("search.idx");
+    if once {
+        index_pass(&roots, &idx, &status);
+        return 0;
+    }
+    let (tx, rx) = mpsc::channel();
+    let me = crate::net::new_id();
+    let Ok(net) = Net::start(me, "Search hub".into(), crate::team::my_pc(), true, Sink::Channel(tx)) else { return 4 };
+    let net = Arc::new(net);
+    // Indexing runs beside the searches; the first pass starts at once.
+    {
+        let (roots, idx, status) = (roots.clone(), idx.clone(), status.clone());
+        std::thread::spawn(move || loop {
+            index_pass(&roots, &idx, &status);
+            std::thread::sleep(std::time::Duration::from_secs(600));
+        });
+    }
+    for e in rx {
+        if let Event::Msg { from, msg: Msg::SearchReq { qid, query } } = e {
+            let (net, idx) = (net.clone(), idx.clone());
+            std::thread::spawn(move || {
+                let q = crate::search::Query { pat: query, case: false, word: false, regex: false };
+                let text = search(&idx, &q);
+                net.send(from, &Msg::SearchRes { qid, text });
+            });
+        }
+    }
+    0
+}
+
+/// One indexing pass, with progress and the outcome in hub.txt.
+fn index_pass(roots: &[PathBuf], idx: &Path, status: &Path) {
+    let mut log = |s: &str| {
+        let _ = std::fs::write(status, format!("indexing: {s}\r\n"));
+    };
+    let line = match build(roots, idx, &mut log) {
+        Ok(s) => s,
+        Err(e) => format!("error: {e}"),
+    };
+    let _ = std::fs::write(status, format!("{line}\r\nat={}\r\n", crate::team::now()));
 }
 
 /// Searches through the index; results text in the find-in-files format.
-pub fn search(team: &Path, q: &Query) -> String {
-    let idx_path = index_dir(team).join("search.idx");
-    let mut ix = match Index::open(&idx_path) {
+pub fn search(idx_path: &Path, q: &Query) -> String {
+    let mut ix = match Index::open(idx_path) {
         Ok(ix) => ix,
-        Err(_) => {
-            return format!(
-                "Search \"{}\": no team index yet.\n  Run slate.exe --hub on an always-on PC, with the folders to index listed in {}\n",
-                q.pat,
-                index_dir(team).join("roots.txt").display()
-            )
-        }
+        Err(_) => return format!("Search \"{}\": the search hub has not finished its first index yet \u{2013} try again in a few minutes\n", q.pat),
     };
     let m = match q.compile() {
         Ok(m) => m,
@@ -426,6 +449,11 @@ pub fn search(team: &Path, q: &Query) -> String {
             hits += n;
             body += &format!("  {} ({n} hit{})\n", f.path, if n == 1 { "" } else { "s" });
             body += &lines;
+        }
+        // Keep the answer to a sensible size.
+        if body.len() > 8 << 20 {
+            body += "  (results cut short \u{2013} search for something more specific)\n";
+            break;
         }
     }
     let more = if capped { format!("; {} more candidate files not checked \u{2013} search for something more specific", cands.len() - MAX_VERIFY) } else { String::new() };

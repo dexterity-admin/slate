@@ -73,6 +73,36 @@ impl Op {
         self
     }
 
+    /// The operation that changes nothing in a text of length `len`.
+    pub fn identity(len: usize) -> Op {
+        let mut o = Op::new();
+        o.retain(len);
+        o
+    }
+
+    /// The operation that takes `op.apply(doc)` back to `doc`.
+    #[cfg(test)]
+    pub fn invert(&self, doc: &[u8]) -> Op {
+        let mut o = Op::new();
+        let mut at = 0;
+        for p in &self.parts {
+            match p {
+                Part::Retain(n) => {
+                    o.retain(*n);
+                    at += n;
+                }
+                Part::Insert(s) => {
+                    o.delete(s.len());
+                }
+                Part::Delete(n) => {
+                    o.insert(&doc[at..at + n]);
+                    at += n;
+                }
+            }
+        }
+        o
+    }
+
     /// Replacing bytes a..b of a document of length `len` with `text`.
     pub fn replace(len: usize, a: usize, b: usize, text: &[u8]) -> Op {
         let mut o = Op::new();
@@ -104,6 +134,7 @@ impl Op {
         out
     }
 
+    #[cfg(test)]
     pub fn apply(&self, doc: &[u8]) -> Option<Vec<u8>> {
         if doc.len() != self.base {
             return None;
