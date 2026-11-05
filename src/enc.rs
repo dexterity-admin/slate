@@ -281,6 +281,13 @@ impl StreamDecoder {
         StreamDecoder { enc: force, carry: Vec::new(), pending_cr: false, started: false, crlf: 0, lf: 0, cr: 0 }
     }
 
+    /// Carries on decoding a file already read up to some point, in its
+    /// known encoding. `ends_cr` says the bytes so far ended with a CR (its
+    /// LF may come next and must not make a second line break).
+    pub fn resume(enc: Enc, ends_cr: bool) -> StreamDecoder {
+        StreamDecoder { enc: Some(enc), carry: Vec::new(), pending_cr: ends_cr, started: true, crlf: 0, lf: 0, cr: 0 }
+    }
+
     /// The next piece, decoded to UTF-8 with line endings made `\n`.
     /// `last` marks the end of the file.
     pub fn push(&mut self, raw: &[u8], last: bool) -> Result<Vec<u8>, NotUtf8> {

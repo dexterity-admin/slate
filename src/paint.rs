@@ -676,6 +676,12 @@ impl App {
             if self.overtype {
                 segs.push(("OVR".into(), 7));
             }
+            // Following a log, or a log that could be followed.
+            if b.follow.is_some() {
+                segs.push(("\u{25CF} Following".into(), 14));
+            } else if b.path.as_ref().and_then(|p| p.extension()).map_or(false, |e| e.eq_ignore_ascii_case("log") || e.eq_ignore_ascii_case("out")) && b.loading.is_none() {
+                segs.push(("Follow".into(), 14));
+            }
             if let Some(c) = &b.collab {
                 let _ = c;
                 if let Some(text) = self.collab_status(self.bi(b.id)) {

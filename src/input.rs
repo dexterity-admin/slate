@@ -91,6 +91,7 @@ fn key_cmd(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<Cmd> {
         (true, false, true, v) if v == k('C') => Cmd::Compare,
         (true, true, false, v) if v == k('E') => Cmd::CoEdit,
         (true, true, false, v) if v == k('I') => Cmd::TeamSearch,
+        (true, true, false, v) if v == k('W') => Cmd::Follow,
         (false, false, false, 0x76) => Cmd::CompareNext,
         (false, true, false, 0x76) => Cmd::ComparePrev,
         (false, false, false, 0x74) => Cmd::CompareRefresh,
@@ -862,6 +863,7 @@ impl App {
             10 => Cmd::Grid,
             11 => Cmd::GridDelim,
             12 | 13 => return self.team_file_menu(),
+            14 => return self.follow_status_click(),
             _ => return,
         };
         self.exec(c);

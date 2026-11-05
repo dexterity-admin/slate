@@ -76,7 +76,7 @@ pub enum Cmd {
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
     Compare, CompareFile, CompareSaved, CompareNext, ComparePrev, CompareRefresh, CompareSwap,
     CompareWs, CompareCase, CompareClose,
-    TeamPeople, TeamLock, TeamToggle, TeamName, CoEdit, TeamSearch,
+    TeamPeople, TeamLock, TeamToggle, TeamName, CoEdit, TeamSearch, Follow,
     LibSnippet, LibSaveSnippet, LibMacro, LibSaveMacro, LibPreset, LibSavePreset, LibFolder, LibDelete,
 }
 
@@ -154,6 +154,7 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::NextTab, "View: Next Tab", "Ctrl+Tab"),
     (Cmd::PrevTab, "View: Previous Tab", "Ctrl+Shift+Tab"),
     (Cmd::Grid, "View: Toggle CSV Grid / Text", "Ctrl+Shift+G"),
+    (Cmd::Follow, "View: Follow File as It Grows (Tail)", "Ctrl+Shift+W"),
     (Cmd::GridHeader, "Grid: Toggle First Row as Header", ""),
     (Cmd::GridDelim, "Grid: Set Column Delimiter…", ""),
     (Cmd::GridClear, "Grid: Clear Filters and Sort", ""),
@@ -1063,10 +1064,22 @@ impl App {
     /// Why the current buffer cannot be edited.
     pub fn read_only_reason(&self) -> String {
         let b = self.cur_ref();
-        match &b.locked_by {
-            Some(by) => format!("{by} has locked this file for editing \u{2013} it is read-only until they unlock or close it"),
-            None => "The compare view is read-only \u{2013} edit the file itself, then F5 refreshes".into(),
+        if let Some(by) = &b.locked_by {
+            return format!("{by} has locked this file for editing \u{2013} it is read-only until they unlock or close it");
         }
+        if b.follow.is_some() {
+            return "Following this file as it grows \u{2013} Ctrl+Shift+W stops, then it can be edited".into();
+        }
+        if b.saving.is_some() {
+            return "Saving \u{2013} the file can be edited again in a moment".into();
+        }
+        if b.loading.is_some() {
+            return "Still loading \u{2013} the file can be edited once it has all arrived".into();
+        }
+        if b.collab.as_ref().map_or(false, |c| c.joining()) {
+            return "Joining co-editing\u{2026}".into();
+        }
+        "The compare view is read-only \u{2013} edit the file itself, then F5 refreshes".into()
     }
 
     pub fn update_title(&self) {
@@ -1351,8 +1364,9 @@ impl App {
             let b = &self.bufs[i];
             let Some(p) = &b.path else { continue };
             let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified()) else { continue };
-            // Co-editors save the shared text; that is not an outside change.
-            if b.collab.is_some() {
+            // Co-editors save the shared text, and a followed file grows by
+            // itself: neither is an outside change to ask about.
+            if b.collab.is_some() || b.follow.is_some() {
                 self.bufs[i].mtime = Some(m);
                 continue;
             }
@@ -1917,6 +1931,10 @@ impl App {
             }
             Cmd::CoEdit => {
                 self.collab_toggle();
+                changed = false;
+            }
+            Cmd::Follow => {
+                self.follow_toggle();
                 changed = false;
             }
             Cmd::TeamToggle => {

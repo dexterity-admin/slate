@@ -11,6 +11,7 @@ mod doc;
 mod grid;
 mod edit;
 mod enc;
+mod follow;
 mod gfx;
 mod icons;
 mod index;
@@ -348,6 +349,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         app::WM_LOADED => {
             let l = Box::from_raw(lp.0 as *mut app::Loaded);
             a.on_loaded(*l);
+        }
+        follow::WM_FOLLOW => {
+            let g = Box::from_raw(lp.0 as *mut follow::Grown);
+            a.on_follow(*g);
         }
         app::WM_SAVED => {
             let s = Box::from_raw(lp.0 as *mut app::Saved);
