@@ -681,8 +681,9 @@ impl App {
         let mut seen: Vec<String> = Vec::new();
         let mut out = Vec::new();
         for p in t.peers.iter().filter(|p| p.id != t.me) {
-            // One avatar per person, even with several Slate windows.
-            if seen.contains(&p.name) {
+            // One avatar per person, even with several Slate windows; your
+            // own other windows are not "someone online".
+            if seen.contains(&p.name) || (p.name == t.name && p.pc == t.pc) {
                 continue;
             }
             seen.push(p.name.clone());

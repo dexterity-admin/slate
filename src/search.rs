@@ -163,6 +163,13 @@ pub fn find_in_files(req: &FifRequest) -> String {
     )
 }
 
+/// Hits in one file: (count, result lines). None for no hit, or a file
+/// that is too big or not text.
+pub fn search_path(p: &Path, m: &Matcher) -> Option<(usize, String)> {
+    let mut n = 0;
+    search_file(p, m, &mut n)
+}
+
 fn search_file(p: &Path, m: &Matcher, searched: &mut usize) -> Option<(usize, String)> {
     let meta = std::fs::metadata(p).ok()?;
     if meta.len() > 64 << 20 {

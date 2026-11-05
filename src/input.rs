@@ -90,6 +90,7 @@ fn key_cmd(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<Cmd> {
         (true, true, false, v) if v == k('G') => Cmd::Grid,
         (true, false, true, v) if v == k('C') => Cmd::Compare,
         (true, true, false, v) if v == k('E') => Cmd::CoEdit,
+        (true, true, false, v) if v == k('I') => Cmd::TeamSearch,
         (false, false, false, 0x76) => Cmd::CompareNext,
         (false, true, false, 0x76) => Cmd::ComparePrev,
         (false, false, false, 0x74) => Cmd::CompareRefresh,

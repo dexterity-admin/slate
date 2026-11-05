@@ -2,8 +2,9 @@
 
 # Slate
 
-A small, fast text editor for Windows: the everyday Notepad++ feature set in a
-single ~700 KB executable with a modern, fully custom-drawn interface.
+A small, fast text editor for Windows: the everyday Notepad++ feature set, plus a CSV grid,
+revision compare and team features, in a single executable under 1 MB with a modern, fully
+custom-drawn interface.
 
 - **[Download the installer](https://github.com/dexterity-admin/slate/releases/latest)** (per-user, no admin rights) or the portable zip; Slate keeps itself up to date
 - Direct2D / DirectWrite rendering, light and dark themes (follows Windows on first run), seven accent colours
@@ -109,6 +110,33 @@ another (Rev 0 against Rev A).
   Ctrl+Alt+C again (or closing either side) closes it.
 - Large files: two 1,000,000-line files compare in about two seconds.
 
+## Team features
+
+Everything runs through one **team folder** on the file server that everyone can write to
+(**Team: Set Team Folder**). There is no server program to install and Slate opens no network
+ports, so firewalls are not involved. Without a team folder these features are off.
+
+- **Who's online** – avatars in the title bar; click them to see who has which file open and open
+  it. Tabs show a coloured dot for each colleague who has the same file open (solid when they have
+  unsaved changes), and the status bar names them.
+- **Warnings** – opening a file a colleague has open, or starting to change one they have unsaved
+  changes in, says so.
+- **Locks** – **Team: Lock / Unlock This File** makes the file read-only for everyone else until
+  you unlock it or close it.
+- **Co-editing** – Ctrl+Shift+E on a shared file starts co-editing; colleagues who have it open are
+  offered to join with the same key. Everyone types at once and sees the others' named carets;
+  anyone can save. Changes travel through an append-only log in the team folder and are merged by
+  operational transformation, so nobody's typing is lost.
+- **Library** – snippets, shared macros and find / replace presets kept in
+  `<team folder>\library` (**Library:** commands insert, run, use and save them).
+- **Instant search** (Ctrl+Shift+I) – searches an index of the project folders: file names and text,
+  case-insensitive, results like Find in Files. The index is kept by one always-on PC running
+  `slate.exe --hub` (for example from Task Scheduler at log-on), which re-reads only changed files
+  every 10 minutes. List the folders to index, one per line, in `<team folder>\index\roots.txt`.
+
+Mapped drive letters are translated to their `\\server\share` paths, so everyone names a file the
+same way. If the team folder cannot be reached, team features pause and resume by themselves.
+
 Everything is reachable from the **command palette** (Ctrl+Shift+P, F1 or the ≡ button), which
 also lists each shortcut. Status-bar items are clickable (line → go to line, encoding, line
 ending, language, tab width, zoom, wrap).
@@ -144,6 +172,8 @@ ending, language, tab width, zoom, wrap).
 | Ctrl+Shift+G | CSV grid / text view |
 | Ctrl+Alt+C | Compare with… / close compare |
 | F7 / Shift+F7, F5 | Next / previous difference, refresh compare |
+| Ctrl+Shift+E | Co-edit this file (start / join / leave) |
+| Ctrl+Shift+I | Instant search in the team index |
 | Insert | Overtype |
 
 ## Command line
@@ -155,6 +185,7 @@ slate.exe [files...] [-multiInst] [-nosession]
 `-multiInst` starts a separate window instead of handing files to the running one;
 `-nosession` neither restores nor saves the session or backups.
 `slate.exe <file> <milliseconds>` is benchmark mode (closes itself, touches no settings).
+`slate.exe --hub [--once]` keeps the team search index current (no window; `--once` runs one pass).
 
 ## Known limits
 
@@ -165,6 +196,10 @@ slate.exe [files...] [-multiInst] [-nosession]
 - Not included, by agreement: Notepad++ plugins, function list, document map, printing,
   localization.
 - The compare view is read-only, does not wrap lines and does not fold.
+- While co-editing, a colleague's change clears your undo history (its positions no longer hold).
+  Co-editing follows each other within about a second, depending on the file server.
+- Instant search is literal text (no regular expressions through the index) and checks at most
+  3,000 candidate files per search.
 - The grid cannot add rows to an empty table or insert columns; use the text view (or paste rows
   past the end).
 - Context menus, file dialogs and message boxes are the native Windows ones.
@@ -183,10 +218,12 @@ cargo test --release
 Source layout: `doc.rs` gap buffer + line index · `buffer.rs` selections, undo, folds, bookmarks ·
 `edit.rs` text commands · `csv.rs` table index, filters, sort, Excel clipboard formats ·
 `grid.rs` the grid view · `diff.rs` line diff and alignment · `compare.rs` the compare view ·
+`team.rs` presence and locks · `ot.rs` + `collab.rs` co-editing · `library.rs` team library ·
+`index.rs` search index and hub ·
 `syntax.rs` lexers · `enc.rs` encodings · `search.rs` find / find in
 files · `app.rs` tabs, views, commands, session · `view.rs` layout cache and scrolling ·
 `paint.rs` rendering · `input.rs` keyboard and mouse · `ui.rs` chrome geometry · `gfx.rs`
 Direct2D resources · `sys.rs` clipboard, dialogs · `main.rs` window and message loop.
 
-Test tools: `tools\drive.ps1` drives a live window and takes screenshots; `tools\bench.ps1`
-produces the table above.
+Test tools: `tools\drive.ps1` drives a live window and takes screenshots; `tools\duo.ps1` drives two
+windows as two team members sharing a team folder; `tools\bench.ps1` produces the table above.

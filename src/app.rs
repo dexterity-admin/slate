@@ -53,7 +53,8 @@ pub enum Cmd {
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
     Compare, CompareFile, CompareSaved, CompareNext, ComparePrev, CompareRefresh, CompareSwap,
     CompareWs, CompareCase, CompareClose,
-    TeamPeople, TeamLock, TeamFolder, TeamName, CoEdit,
+    TeamPeople, TeamLock, TeamFolder, TeamName, CoEdit, TeamSearch,
+    LibSnippet, LibSaveSnippet, LibMacro, LibSaveMacro, LibPreset, LibSavePreset, LibFolder,
 }
 
 pub static COMMANDS: &[(Cmd, &str, &str)] = &[
@@ -151,6 +152,14 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::TeamLock, "Team: Lock / Unlock This File for Editing", ""),
     (Cmd::TeamFolder, "Team: Set Team Folder\u{2026}", ""),
     (Cmd::TeamName, "Team: Set Your Display Name\u{2026}", ""),
+    (Cmd::TeamSearch, "Search: Instant Search in Team Index\u{2026}", "Ctrl+Shift+I"),
+    (Cmd::LibSnippet, "Library: Insert Snippet\u{2026}", ""),
+    (Cmd::LibSaveSnippet, "Library: Save Selection as Snippet\u{2026}", ""),
+    (Cmd::LibMacro, "Library: Run Shared Macro\u{2026}", ""),
+    (Cmd::LibSaveMacro, "Library: Share Last Macro\u{2026}", ""),
+    (Cmd::LibPreset, "Library: Use Find / Replace Preset\u{2026}", ""),
+    (Cmd::LibSavePreset, "Library: Save Find / Replace as Preset\u{2026}", ""),
+    (Cmd::LibFolder, "Library: Open Library Folder", ""),
     (Cmd::Language, "Document: Set Language…", ""),
     (Cmd::Encoding, "Document: Convert Encoding…", ""),
     (Cmd::ReopenEncoding, "Document: Reopen with Encoding…", ""),
@@ -263,6 +272,10 @@ pub enum PalAct {
     Accent(usize),
     Delim(u8),
     Compare(u32),
+    /// Team library files.
+    Snippet(String),
+    Macro(String),
+    Preset(String),
 }
 
 pub struct PalItem {
@@ -276,7 +289,8 @@ pub enum PalMode {
     Commands,
     Goto,
     List,
-    /// Free text answered with Enter: 1 team folder, 2 display name.
+    /// Free text answered with Enter: 1 team folder, 2 display name,
+    /// 3 instant search, 4 snippet name, 5 macro name, 6 preset name.
     Prompt(u8),
 }
 
@@ -396,7 +410,7 @@ pub enum Drag {
     GridH { view: usize, grab: f32 },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Action {
     Char(char),
     Key(u32, bool, bool, bool),
@@ -1438,7 +1452,19 @@ impl App {
         let line = b.doc.line_of(b.caret());
         let from = line.saturating_sub(5000);
         let lines: Vec<String> = (from..=line).map(|l| String::from_utf8_lossy(&b.doc.text(b.doc.line_start(l), b.doc.line_end(l))).into_owned()).collect();
-        let Some((path, n)) = search::result_target(&lines, lines.len() - 1) else { return false };
+        let Some((path, n)) = search::result_target(&lines, lines.len() - 1) else {
+            // A file-name match (instant search) or a file heading: open it.
+            let l = lines.last().map(|s| s.trim()).unwrap_or("");
+            let path = l.rsplit_once(" (").map(|(p, _)| p).unwrap_or(l).to_string();
+            if !path.is_empty() && Path::new(&path).is_file() {
+                if self.split {
+                    self.av = 1 - self.av;
+                }
+                self.open_path(&path);
+                return true;
+            }
+            return false;
+        };
         let q = self.last_find.clone();
         if self.split {
             self.av = 1 - self.av;
@@ -1504,7 +1530,11 @@ impl App {
             let text = p.input.text.clone();
             match k {
                 1 => self.team_set_folder(&text),
-                _ => self.team_set_name(&text),
+                2 => self.team_set_name(&text),
+                3 => self.team_search(&text),
+                4 => self.lib_save_snippet(&text),
+                5 => self.lib_save_macro(&text),
+                _ => self.lib_save_preset(&text),
             }
             return self.redraw();
         }
@@ -1573,6 +1603,9 @@ impl App {
             }
             PalAct::Delim(d) => self.grid_set_delim(d),
             PalAct::Compare(id) => self.compare_buf(id),
+            PalAct::Snippet(p) => self.lib_insert(&p),
+            PalAct::Macro(p) => self.lib_run_macro(&p),
+            PalAct::Preset(p) => self.lib_use_preset(&p),
             PalAct::TabSize(n) => {
                 settings::get_mut().tab_size = n;
                 for b in self.bufs.iter_mut() {
@@ -1705,6 +1738,32 @@ impl App {
                 let title = "Your name as others see it";
                 let cur = crate::team::my_name();
                 self.open_palette(PalMode::Prompt(2), title, Vec::new(), &cur);
+                changed = false;
+            }
+            Cmd::TeamSearch => {
+                // Seed with the selection, like Find.
+                let b = self.cur_ref();
+                let p = b.primary();
+                let seed = if !p.is_empty() && p.hi() - p.lo() < 200 { String::from_utf8_lossy(&b.doc.text(p.lo(), p.hi())).into_owned() } else { String::new() };
+                self.open_palette(PalMode::Prompt(3), "Instant search: text in any indexed project file, or a file name", Vec::new(), seed.lines().next().unwrap_or(""));
+                changed = false;
+            }
+            Cmd::LibSnippet | Cmd::LibMacro | Cmd::LibPreset | Cmd::LibFolder => {
+                match c {
+                    Cmd::LibSnippet => self.lib_snippets(),
+                    Cmd::LibMacro => self.lib_macros(),
+                    Cmd::LibPreset => self.lib_presets(),
+                    _ => self.lib_open_folder(),
+                }
+                changed = false;
+            }
+            Cmd::LibSaveSnippet | Cmd::LibSaveMacro | Cmd::LibSavePreset => {
+                let (k, title) = match c {
+                    Cmd::LibSaveSnippet => (4, "Snippet name"),
+                    Cmd::LibSaveMacro => (5, "Name for the shared macro"),
+                    _ => (6, "Preset name"),
+                };
+                self.open_palette(PalMode::Prompt(k), title, Vec::new(), "");
                 changed = false;
             }
             Cmd::Compare => {

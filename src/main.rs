@@ -13,6 +13,8 @@ mod edit;
 mod enc;
 mod gfx;
 mod icons;
+mod index;
+mod library;
 mod input;
 mod paint;
 mod search;
@@ -408,6 +410,11 @@ fn forward_to_running(files: &[String]) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Headless search hub: keeps the team's search index current.
+    if args.iter().any(|a| a == "--hub") {
+        settings::load();
+        std::process::exit(index::hub_main(args.iter().any(|a| a == "--once")));
+    }
     let mut files = Vec::new();
     let mut bench_ms = 0u32;
     let mut multi = false;
