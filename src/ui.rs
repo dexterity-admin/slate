@@ -110,8 +110,7 @@ impl App {
 
     /// Tab rectangles of view `v` and the "+" button.
     pub fn tab_layout(&self, v: usize) -> (Vec<Rect>, Rect) {
-        let (vx, _, vw, _) = self.view_rect(v);
-        let y = TITLE_H;
+        let (vx, y, vw, _) = self.view_rect(v);
         let mut widths: Vec<f32> = self.views[v]
             .tabs
             .iter()
@@ -159,7 +158,7 @@ impl App {
         let pw = (self.w - 40.0).min(640.0);
         let rows = p.shown.len().min(PAL_MAX).max(1);
         let h = PAL_INPUT + rows as f32 * PAL_ROW + if rows > 0 { 10.0 } else { 0.0 };
-        Some((r((self.w - pw) / 2.0, TITLE_H + 6.0, pw, h), rows))
+        Some((r((self.w - pw) / 2.0, self.top() + 6.0, pw, h), rows))
     }
 
     /// Find panel rectangle, the field rectangles and the button rectangles.
@@ -245,6 +244,9 @@ impl App {
                 return Hit::People;
             }
             return Hit::Caption;
+        }
+        if let Some(h) = self.tool_hit(x, y) {
+            return h;
         }
         if let Some(part) = self.ai_hit(x, y) {
             return Hit::Ai(part);

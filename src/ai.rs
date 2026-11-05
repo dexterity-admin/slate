@@ -504,7 +504,7 @@ pub const P_PANEL: u8 = 0;
 impl App {
     /// The panel's rectangle, when open.
     pub fn ai_rect(&self) -> Option<crate::ui::Rect> {
-        (self.ai.open && self.w > PANEL_W + 300.0).then(|| crate::ui::r(self.w - PANEL_W, crate::app::TITLE_H, PANEL_W, (self.h - crate::app::TITLE_H - crate::app::STATUS_H).max(0.0)))
+        (self.ai.open && self.w > PANEL_W + 300.0).then(|| crate::ui::r(self.w - PANEL_W, self.top(), PANEL_W, (self.h - self.top() - crate::app::STATUS_H).max(0.0)))
     }
 
     /// The clickable parts of the panel.

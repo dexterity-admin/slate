@@ -70,7 +70,7 @@ pub enum Cmd {
     ToggleComment, Comment, Uncomment, Duplicate, DeleteLine, MoveUp, MoveDown, Upper, Lower, TitleCase,
     SortAsc, SortDesc, Unique, Reverse, Trim, Join, TabsToSpaces, SpacesToTabs, ToggleBookmark,
     NextBookmark, PrevBookmark, ClearBookmarks, ToggleFold, FoldAll, UnfoldAll, ZoomIn, ZoomOut,
-    ZoomReset, Wrap, Whitespace, Theme, MoveOther, CloneOther, FocusOther, CloseSplit, MacroRecord,
+    ZoomReset, Wrap, Whitespace, Theme, Toolbar, SplitView, MoveOther, CloneOther, FocusOther, CloseSplit, MacroRecord,
     MacroPlay, Language, Encoding, ReopenEncoding, LineEnding, TabSize, UseTabs, Overtype, NextTab,
     PrevTab, ToggleSession, About, CheckUpdates, InstallUpdate, AutoUpdate, Accent, Animations,
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
@@ -145,6 +145,8 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::Wrap, "View: Toggle Word Wrap", "Alt+Z"),
     (Cmd::Whitespace, "View: Toggle Whitespace and Line Endings", ""),
     (Cmd::Theme, "View: Toggle Light / Dark Theme", ""),
+    (Cmd::Toolbar, "View: Show / Hide Toolbar", ""),
+    (Cmd::SplitView, "View: Split View / Close Split", ""),
     (Cmd::Accent, "View: Accent Colour…", ""),
     (Cmd::Animations, "View: Toggle Animations", ""),
     (Cmd::Acrylic, "View: Toggle Translucent Window (Acrylic)", ""),
@@ -428,6 +430,9 @@ pub enum Hit {
     People,
     /// A part of the AI panel (see ai::P_*).
     Ai(u8),
+    /// A toolbar button (index into toolbar::TOOLS), or the bar around them.
+    Tool(usize),
+    ToolBar,
 }
 
 pub enum Drag {
@@ -523,6 +528,10 @@ pub struct App {
     pub library: crate::library::Store,
     /// The instant search waiting for the hub's answer.
     pub search_qid: Option<u64>,
+    /// The toolbar is shown (a copy of the setting, read on every layout).
+    pub toolbar: bool,
+    /// Toolbar button whose tooltip is showing.
+    pub tip: Option<usize>,
 }
 
 pub fn invalidate(hwnd: HWND) {
@@ -591,6 +600,8 @@ impl App {
             splash_since: None,
             library: crate::library::Store::load(),
             search_qid: None,
+            toolbar: settings::get().toolbar,
+            tip: None,
         }
     }
 
@@ -1902,8 +1913,8 @@ impl App {
             c,
             Cmd::New | Cmd::Open | Cmd::Close | Cmd::CloseAll | Cmd::CloseOthers | Cmd::ReopenClosed | Cmd::Recent
                 | Cmd::SwitchFile | Cmd::Reveal | Cmd::CopyPath | Cmd::Exit | Cmd::Palette | Cmd::ZoomIn | Cmd::ZoomOut
-                | Cmd::ZoomReset | Cmd::Wrap | Cmd::Whitespace | Cmd::Theme | Cmd::MoveOther | Cmd::CloneOther
-                | Cmd::FocusOther | Cmd::CloseSplit | Cmd::NextTab | Cmd::PrevTab | Cmd::ToggleSession | Cmd::About
+                | Cmd::ZoomReset | Cmd::Wrap | Cmd::Whitespace | Cmd::Theme | Cmd::Toolbar | Cmd::SplitView
+                | Cmd::MoveOther | Cmd::CloneOther | Cmd::FocusOther | Cmd::CloseSplit | Cmd::NextTab | Cmd::PrevTab | Cmd::ToggleSession | Cmd::About
                 | Cmd::CheckUpdates | Cmd::InstallUpdate | Cmd::AutoUpdate | Cmd::SaveAll | Cmd::FindInFiles
                 | Cmd::MacroRecord | Cmd::UseTabs | Cmd::TabSize | Cmd::Accent | Cmd::Animations
                 | Cmd::GotoLine | Cmd::Copy | Cmd::SelectAll | Cmd::TeamPeople | Cmd::TeamSearch
@@ -2457,6 +2468,18 @@ impl App {
                 }
                 changed = false;
             }
+            Cmd::Toolbar => {
+                let on = {
+                    let mut s = settings::get_mut();
+                    s.toolbar = !s.toolbar;
+                    s.toolbar
+                };
+                self.toolbar = on;
+                self.tip = None;
+                self.flash(if on { "Toolbar shown" } else { "Toolbar hidden \u{2013} View: Show / Hide Toolbar brings it back" });
+                changed = false;
+            }
+            Cmd::SplitView => return self.exec(if self.split { Cmd::CloseSplit } else { Cmd::CloneOther }),
             Cmd::CloseSplit => {
                 if self.split {
                     let moved: Vec<Tab> = self.views[1].tabs.drain(..).collect();

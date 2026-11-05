@@ -240,6 +240,10 @@ impl Buffer {
         !self.undo.is_empty()
     }
 
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
     pub fn primary(&self) -> Sel {
         *self.sels.last().unwrap()
     }

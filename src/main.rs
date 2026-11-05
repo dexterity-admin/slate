@@ -26,6 +26,7 @@ mod ot;
 mod syntax;
 mod sys;
 mod team;
+mod toolbar;
 mod wire;
 mod ui;
 mod update;
@@ -251,6 +252,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             if a.hover != Hit::None {
                 a.hover = Hit::None;
+                a.tool_hover(Hit::None);
                 a.redraw();
             }
         }
@@ -300,6 +302,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app::T_LOAD | app::T_ANIM => a.redraw(),
             grid::T_FILTER => a.on_filter_timer(),
             collab::T_COLLAB => a.collab_tick(),
+            toolbar::T_TIP => a.on_tip_timer(),
             updater_ui::T_UPDATE => a.on_update_timer(),
             updater_ui::T_HANDSHAKE => a.on_handshake_timer(),
             updater_ui::T_CLEANUP => a.on_cleanup_timer(),

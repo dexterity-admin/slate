@@ -113,7 +113,8 @@ pub struct Gfx {
     /// channel and the chrome colours are see-through.
     pub acrylic: bool,
     stroke: Option<ID2D1StrokeStyle>,
-    geos: RefCell<HashMap<Icon, ID2D1PathGeometry>>,
+    /// Icon geometries; `true` for the icon's accent stroke.
+    geos: RefCell<HashMap<(Icon, bool), ID2D1PathGeometry>>,
     /// Brushes for one-off colours (file badges), keyed by rgb and alpha.
     tints: RefCell<HashMap<(u32, u8), ID2D1SolidColorBrush>>,
     /// The app icon as bitmaps, keyed by pixel size.
@@ -329,13 +330,25 @@ impl Gfx {
     }
 
     pub fn draw_icon_brush(&self, icon: Icon, x: f32, y: f32, w: f32, h: f32, brush: &ID2D1SolidColorBrush, size: f32, width: f32) {
+        self.stroke_icon((icon, false), x, y, w, h, brush, size, width);
+    }
+
+    /// The icon's accent stroke, if it has one.
+    pub fn draw_icon_accent(&self, icon: Icon, x: f32, y: f32, w: f32, h: f32, brush: &ID2D1SolidColorBrush, size: f32, width: f32) {
+        if icon.accent_path().is_some() {
+            self.stroke_icon((icon, true), x, y, w, h, brush, size, width);
+        }
+    }
+
+    fn stroke_icon(&self, key: (Icon, bool), x: f32, y: f32, w: f32, h: f32, brush: &ID2D1SolidColorBrush, size: f32, width: f32) {
         let geo = {
             let mut g = self.geos.borrow_mut();
-            if !g.contains_key(&icon) {
-                let Ok(geo) = icons::build(&self.d2d, icon) else { return };
-                g.insert(icon, geo);
+            if !g.contains_key(&key) {
+                let path = if key.1 { key.0.accent_path().unwrap_or("") } else { key.0.path() };
+                let Ok(geo) = icons::build(&self.d2d, path) else { return };
+                g.insert(key, geo);
             }
-            g[&icon].clone()
+            g[&key].clone()
         };
         let k = size / 16.0;
         let ox = x + (w - size) / 2.0;

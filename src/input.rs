@@ -1,6 +1,6 @@
 //! Keyboard and mouse handling.
 
-use crate::app::{Action, App, Cmd, Drag, Hit, TITLE_H};
+use crate::app::{Action, App, Cmd, Drag, Hit};
 use crate::buffer::{EditKind, Sel};
 use crate::edit::{self, Move};
 use crate::sys;
@@ -440,6 +440,12 @@ impl App {
         }
         match hit {
             Hit::Ai(part) => self.ai_click(part),
+            // Buttons act on release, so a press can still be dragged off.
+            Hit::Tool(_) => {
+                self.tool_hover(Hit::None);
+                self.capture();
+                self.redraw();
+            }
             Hit::Menu => self.command_palette(),
             Hit::People => self.team_people(),
             Hit::Grid(v) => self.grid_mouse_down(v, x, y, shift),
@@ -573,6 +579,9 @@ impl App {
             let chrome = |h: Hit| !matches!(h, Hit::Text(_) | Hit::None);
             let repaint = chrome(hit) || chrome(self.hover);
             self.hover = hit;
+            if self.pressed == Hit::None {
+                self.tool_hover(hit);
+            }
             if repaint {
                 self.redraw();
             }
@@ -693,6 +702,7 @@ impl App {
                     self.close_tab(v, i);
                 }
                 Hit::FindBtn(id) => self.find_button(id),
+                Hit::Tool(i) => self.tool_click(i),
                 _ => {}
             }
         }
@@ -753,7 +763,7 @@ impl App {
                 return;
             }
         }
-        if y < TITLE_H {
+        if y < self.top() {
             return;
         }
         let v = self.view_at(x);
@@ -781,6 +791,12 @@ impl App {
         }
         match hit {
             Hit::Grid(v) => self.grid_context(v, x, y, pt),
+            Hit::Tool(_) | Hit::ToolBar => {
+                self.tool_hover(Hit::None);
+                if sys::popup_menu(self.hwnd, pt, &[(1, "Hide Toolbar", true)]) == 1 {
+                    self.exec(Cmd::Toolbar);
+                }
+            }
             Hit::Tab(v, i) => {
                 self.views[v].active = i;
                 self.av = v;

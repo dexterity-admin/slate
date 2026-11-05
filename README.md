@@ -49,6 +49,14 @@ takes about its own size in memory.
 
 ## Features
 
+**Toolbar** – the everyday commands as buttons under the title bar, in Slate's own line icons:
+new, open, save, save all, close · cut, copy, paste · undo, redo · find, replace, find in files ·
+zoom in and out · word wrap, spaces and line endings, split view · compare, CSV grid · record and
+play a macro · follow a log, co-edit, AI assistant. Resting the mouse on a button shows what it
+does and its shortcut; buttons that cannot act right now are greyed, and switches such as word
+wrap stay highlighted while on. Right-click the toolbar, or use **View: Show / Hide Toolbar**, to
+hide it.
+
 **Files** – open (multi-select dialog, drag-and-drop, command line), save / save as / save all,
 recent files, reopen closed tab, reload, external-change detection (clean files reload silently,
 modified ones ask), show in Explorer, copy path. A second `slate.exe <file>` hands the file to the
@@ -185,8 +193,8 @@ Light and dark themes, seven accent colours (**View: Accent Colour**), and **Vie
 Translucent Window (Acrylic)** for a frosted title bar, tab strip and status bar (the editor stays
 solid). A short splash with the logo shows when Slate opens or receives files.
 
-Everything is reachable from the **command palette** (Ctrl+Shift+P, F1 or the ≡ button), which
-also lists each shortcut. Status-bar items are clickable (line → go to line, encoding, line
+The common commands are one click away on the toolbar, and everything is reachable from the
+**command palette** (Ctrl+Shift+P, F1 or the ≡ button), which also lists each shortcut. Status-bar items are clickable (line → go to line, encoding, line
 ending, language, tab width, zoom, wrap).
 
 ## Keyboard shortcuts (Notepad++ layout where it has one)

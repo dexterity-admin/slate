@@ -5,6 +5,7 @@
 #   click:X,Y     left click at client pixel X,Y
 #   dclick:X,Y    double click
 #   move:X,Y      mouse move
+#   hover:X,Y     put the real cursor there (tooltips, hover states)
 #   w:MS          wait
 #   shot:NAME     screenshot to <OutDir>\NAME.png
 param(
@@ -31,6 +32,9 @@ public class SW {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string c, string t);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -58,6 +62,8 @@ foreach ($s in $Steps.Split('|')) {
         'click' { $x, $y = $arg.Split(','); [void][SW]::SendMessageW($hw, 0x0201, [IntPtr]1, (MkLp $x $y)); [void][SW]::SendMessageW($hw, 0x0202, [IntPtr]0, (MkLp $x $y)) }
         'dclick' { $x, $y = $arg.Split(','); foreach ($n in 1..2) { [void][SW]::SendMessageW($hw, 0x0201, [IntPtr]1, (MkLp $x $y)); [void][SW]::SendMessageW($hw, 0x0202, [IntPtr]0, (MkLp $x $y)) } }
         'move' { $x, $y = $arg.Split(','); [void][SW]::SendMessageW($hw, 0x0200, [IntPtr]0, (MkLp $x $y)) }
+        # The real cursor, for hover effects (a sent move is undone by WM_MOUSELEAVE).
+        'hover' { $x, $y = $arg.Split(','); $pt = New-Object SW+POINT; $pt.X = [int]$x; $pt.Y = [int]$y; [void][SW]::ClientToScreen($hw, [ref]$pt); [void][SW]::SetForegroundWindow($hw); [void][SW]::SetCursorPos($pt.X, $pt.Y) }
         'close' { [void][SW]::SendMessageW($hw, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero); Start-Sleep -Milliseconds 500 }
         'w' { Start-Sleep -Milliseconds ([int]$arg) }
         'max' { [void][SW]::SendMessageW($hw, 0x0112, [IntPtr]0xF030, [IntPtr]::Zero); Start-Sleep -Milliseconds 400 }

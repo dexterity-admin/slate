@@ -19,6 +19,8 @@ pub struct Settings {
     pub animate: bool,
     /// Translucent (acrylic) title bar, tab strip and status bar.
     pub acrylic: bool,
+    /// The toolbar of icon buttons under the title bar.
+    pub toolbar: bool,
     /// Open .csv / .tsv files in the grid.
     pub csv_grid: bool,
     /// Compare ignores whitespace / letter case.
@@ -53,6 +55,7 @@ static S: RwLock<Settings> = RwLock::new(Settings {
     accent: 0,
     animate: true,
     acrylic: false,
+    toolbar: true,
     csv_grid: true,
     cmp_ws: false,
     cmp_case: false,
@@ -117,6 +120,7 @@ pub fn load() {
             "accent" => s.accent = v.parse().unwrap_or(0usize).min(crate::gfx::ACCENTS.len() - 1),
             "animate" => s.animate = v != "0",
             "acrylic" => s.acrylic = v == "1",
+            "toolbar" => s.toolbar = v != "0",
             "csv_grid" => s.csv_grid = v != "0",
             "cmp_ws" => s.cmp_ws = v == "1",
             "cmp_case" => s.cmp_case = v == "1",
@@ -148,7 +152,7 @@ pub fn save() {
     out += &format!("show_ws={}\nrestore_session={}\n", b(s.show_ws), b(s.restore_session));
     out += &format!("auto_update={}\nskip_version={}\n", b(s.auto_update), s.skip_version);
     out += &format!("accent={}\nanimate={}\ncsv_grid={}\nacrylic={}\n", s.accent, b(s.animate), b(s.csv_grid), b(s.acrylic));
-    out += &format!("cmp_ws={}\ncmp_case={}\n", b(s.cmp_ws), b(s.cmp_case));
+    out += &format!("toolbar={}\ncmp_ws={}\ncmp_case={}\n", b(s.toolbar), b(s.cmp_ws), b(s.cmp_case));
     out += &format!("team={}\nteam_name={}\n", b(s.team), s.team_name);
     out += &format!("ai_url={}\nai_model={}\nai_key={}\n", s.ai_url, s.ai_model, s.ai_key);
     if let Some((x, y, w, h, m)) = s.win {

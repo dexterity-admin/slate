@@ -48,12 +48,14 @@ impl App {
         }
         if self.split {
             let sx = self.view_rect(1).0 - 1.0;
-            self.gfx.fill(sx, TITLE_H, 1.0, self.h - TITLE_H - STATUS_H, C::Border);
+            self.gfx.fill(sx, self.top(), 1.0, self.h - self.top() - STATUS_H, C::Border);
         }
         self.paint_ai();
         self.paint_title();
+        self.paint_toolbar();
         self.paint_status();
         self.paint_find();
+        self.paint_tip();
         self.paint_palette();
         self.paint_splash();
         let r = unsafe { self.gfx.rt().EndDraw(None, None) };
@@ -261,7 +263,10 @@ impl App {
             let c = if hovered && h == Hit::Close { C::OnAccent } else { C::Fg };
             g.draw_icon(icon, rc.x, rc.y, rc.w, rc.h, c, 12.0, 1.1);
         }
-        g.fill(0.0, TITLE_H - 1.0, self.w, 1.0, C::Border);
+        // The toolbar continues the title bar; its own edge closes both.
+        if !self.toolbar {
+            g.fill(0.0, TITLE_H - 1.0, self.w, 1.0, C::Border);
+        }
     }
 
     /// A round badge with initials; `filled` for others, an outline for you.

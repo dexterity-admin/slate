@@ -1,7 +1,7 @@
 //! View geometry, the per-line DirectWrite layout cache, scrolling and
 //! point <-> text position mapping.
 
-use crate::app::{App, LineLayout, SCROLL_W, STATUS_H, TAB_H, TITLE_H};
+use crate::app::{App, LineLayout, SCROLL_W, STATUS_H, TAB_H};
 use crate::gfx::C;
 use crate::settings;
 use crate::syntax::{self, Tok, LANGS};
@@ -24,8 +24,8 @@ pub struct Row {
 
 impl App {
     pub fn view_rect(&self, v: usize) -> (f32, f32, f32, f32) {
-        let y = TITLE_H;
-        let h = (self.h - TITLE_H - STATUS_H).max(0.0);
+        let y = self.top();
+        let h = (self.h - y - STATUS_H).max(0.0);
         // The AI panel, when open, takes the right side.
         let w = self.ai_rect().map_or(self.w, |p| p.x);
         if !self.split {
