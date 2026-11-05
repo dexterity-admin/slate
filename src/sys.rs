@@ -19,6 +19,43 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const CF_UNICODETEXT: u32 = 13;
 
+/// The window's backdrop: acrylic blur behind see-through parts (`moving`:
+/// a plain blur while the window is dragged, as acrylic lags then on
+/// Windows 10), or the normal opaque window.
+pub fn set_backdrop(hwnd: HWND, on: bool, moving: bool, dark: bool) {
+    use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    #[repr(C)]
+    struct Accent {
+        state: u32,
+        flags: u32,
+        color: u32,
+        anim: u32,
+    }
+    #[repr(C)]
+    struct Data {
+        attrib: u32,
+        data: *mut Accent,
+        size: usize,
+    }
+    type SetWca = unsafe extern "system" fn(HWND, *mut Data) -> i32;
+    unsafe {
+        // A one-pixel frame margin keeps the drop shadow. (Extending the
+        // frame over the whole window would make Windows draw its own
+        // caption buttons over Slate's; the accent alone is enough.)
+        let m = windows::Win32::UI::Controls::MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 1 };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        let Ok(user32) = GetModuleHandleW(windows::core::w!("user32.dll")) else { return };
+        let Some(f) = GetProcAddress(user32, windows::core::s!("SetWindowCompositionAttribute")) else { return };
+        let f: SetWca = std::mem::transmute(f);
+        // Gradient colour is ABGR: a light tint of the theme over the blur.
+        let tint = if dark { 0x40201C18 } else { 0x40F8F6F4 };
+        let mut a = Accent { state: if !on { 0 } else if moving { 3 } else { 4 }, flags: 2, color: tint, anim: 0 };
+        let mut d = Data { attrib: 19, data: &mut a, size: std::mem::size_of::<Accent>() };
+        f(hwnd, &mut d);
+    }
+}
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

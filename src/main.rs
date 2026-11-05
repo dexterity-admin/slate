@@ -374,6 +374,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let s = Box::from_raw(lp.0 as *mut String);
             a.fif_done(*s);
         }
+        // Acrylic lags while a window is dragged on Windows 10: plain blur then.
+        WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE if a.gfx.acrylic => {
+            sys::set_backdrop(hwnd, true, msg == WM_ENTERSIZEMOVE, a.gfx.dark);
+        }
         WM_CLOSE => {
             // Wait for background saves; the window closes after them.
             if a.bufs.iter().any(|b| b.saving.is_some()) {
@@ -559,6 +563,11 @@ fn main() {
         // A 1 px frame margin keeps the DWM drop shadow on the borderless window.
         let m = windows::Win32::UI::Controls::MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 1 };
         let _ = windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea(hwnd, &m);
+        if settings::get().acrylic {
+            if let Some(a) = app_from(hwnd) {
+                a.set_acrylic(true);
+            }
+        }
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
         DragAcceptFiles(hwnd, true);
         let maximized = matches!(place, Some((.., true)));

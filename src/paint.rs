@@ -25,12 +25,24 @@ impl App {
         self.caret_target.set(None);
         unsafe {
             self.gfx.rt().BeginDraw();
-            self.gfx.rt().Clear(Some(&self.gfx.color(C::Bg)));
+            if self.gfx.acrylic {
+                // Clear to glass, then lay the editor's own background
+                // under the text so it stays solid and easy to read.
+                self.gfx.rt().Clear(Some(&windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            } else {
+                self.gfx.rt().Clear(Some(&self.gfx.color(C::Bg)));
+            }
         }
         self.cmp_sync_views();
         // Co-editors see the caret wherever it moved since the last frame.
         self.collab_cursor();
         let views = if self.split { 2 } else { 1 };
+        if self.gfx.acrylic {
+            for v in 0..views {
+                let (vx, vy, vw, vh) = self.view_rect(v);
+                self.gfx.fill(vx, vy + TAB_H, vw, (vh - TAB_H).max(0.0), C::Bg);
+            }
+        }
         for v in 0..views {
             self.paint_view(v);
         }

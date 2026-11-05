@@ -76,7 +76,7 @@ pub enum Cmd {
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
     Compare, CompareFile, CompareSaved, CompareNext, ComparePrev, CompareRefresh, CompareSwap,
     CompareWs, CompareCase, CompareClose,
-    TeamPeople, TeamLock, TeamToggle, TeamName, CoEdit, TeamSearch, Follow, Ai, AiServer, AiModel, AiKey,
+    TeamPeople, TeamLock, TeamToggle, TeamName, CoEdit, TeamSearch, Follow, Ai, AiServer, AiModel, AiKey, Acrylic,
     LibSnippet, LibSaveSnippet, LibMacro, LibSaveMacro, LibPreset, LibSavePreset, LibFolder, LibDelete,
 }
 
@@ -147,6 +147,7 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::Theme, "View: Toggle Light / Dark Theme", ""),
     (Cmd::Accent, "View: Accent Colour…", ""),
     (Cmd::Animations, "View: Toggle Animations", ""),
+    (Cmd::Acrylic, "View: Toggle Translucent Window (Acrylic)", ""),
     (Cmd::MoveOther, "View: Move Tab to Other View", ""),
     (Cmd::CloneOther, "View: Clone Tab to Other View", ""),
     (Cmd::FocusOther, "View: Focus Other View", "F8"),
@@ -1069,6 +1070,22 @@ impl App {
         self.redraw();
     }
 
+    /// Turns the translucent chrome on or off: a render target with alpha,
+    /// and the window's backdrop set to acrylic.
+    pub fn set_acrylic(&mut self, on: bool) {
+        self.gfx.acrylic = on;
+        self.gfx.drop_target();
+        self.cache.clear();
+        crate::sys::set_backdrop(self.hwnd, on, false, self.gfx.dark);
+        let mut rc = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(self.hwnd, &mut rc);
+        }
+        let dpi = self.scale * 96.0;
+        let _ = self.gfx.create_target(self.hwnd, rc.right as u32, rc.bottom as u32, dpi);
+        self.redraw();
+    }
+
     /// Why the current buffer cannot be edited.
     pub fn read_only_reason(&self) -> String {
         let b = self.cur_ref();
@@ -1967,6 +1984,16 @@ impl App {
                 self.follow_toggle();
                 changed = false;
             }
+            Cmd::Acrylic => {
+                let on = {
+                    let mut s = settings::get_mut();
+                    s.acrylic = !s.acrylic;
+                    s.acrylic
+                };
+                self.set_acrylic(on);
+                self.flash(if on { "Translucent window on" } else { "Translucent window off" });
+                changed = false;
+            }
             Cmd::Ai => {
                 self.ai_toggle();
                 changed = false;
@@ -2388,6 +2415,9 @@ impl App {
                 self.gfx.dark = dark;
                 let _ = self.gfx.make_brushes();
                 self.cache.clear();
+                if self.gfx.acrylic {
+                    sys::set_backdrop(self.hwnd, true, false, dark);
+                }
                 changed = false;
             }
             Cmd::MoveOther | Cmd::CloneOther => {

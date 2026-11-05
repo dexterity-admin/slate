@@ -109,6 +109,9 @@ pub struct Gfx {
     pub font_px: f32,
     pub dark: bool,
     pub accent: usize,
+    /// Translucent (acrylic) window chrome: the target keeps an alpha
+    /// channel and the chrome colours are see-through.
+    pub acrylic: bool,
     stroke: Option<ID2D1StrokeStyle>,
     geos: RefCell<HashMap<Icon, ID2D1PathGeometry>>,
     /// Brushes for one-off colours (file badges), keyed by rgb and alpha.
@@ -141,13 +144,21 @@ impl Gfx {
                 geos: RefCell::new(HashMap::new()),
                 tints: RefCell::new(HashMap::new()),
                 logos: RefCell::new(HashMap::new()),
+                acrylic: false,
             })
         }
     }
 
     pub fn create_target(&mut self, hwnd: HWND, w: u32, h: u32, dpi: f32) -> Result<()> {
         unsafe {
-            let props = D2D1_RENDER_TARGET_PROPERTIES::default();
+            let mut props = D2D1_RENDER_TARGET_PROPERTIES::default();
+            if self.acrylic {
+                // Keep alpha so the blurred desktop shows through the chrome.
+                props.pixelFormat = windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+                };
+            }
             let hp = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd,
                 pixelSize: D2D_SIZE_U { width: w.max(1), height: h.max(1) },
@@ -156,7 +167,9 @@ impl Gfx {
             let hrt = self.d2d.CreateHwndRenderTarget(&props, &hp)?;
             let rt: ID2D1RenderTarget = hrt.cast()?;
             rt.SetDpi(dpi, dpi);
-            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+            // ClearType needs opaque pixels under the text; over glass the
+            // text is smoothed in grey instead.
+            rt.SetTextAntialiasMode(if self.acrylic { windows::Win32::Graphics::Direct2D::D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE } else { D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE });
             self.hrt = Some(hrt);
             self.rt = Some(rt);
         }
@@ -191,6 +204,13 @@ impl Gfx {
         self.tints.borrow_mut().clear();
         for &c in pal.iter() {
             self.brushes.push(unsafe { rt.CreateSolidColorBrush(&hex(c), None)? });
+        }
+        if self.acrylic {
+            // The title bar, tab strip and status bar become frosted glass.
+            unsafe {
+                self.brushes[C::Chrome as usize].SetOpacity(if self.dark { 0.55 } else { 0.5 });
+                self.brushes[C::Tabs as usize].SetOpacity(if self.dark { 0.45 } else { 0.4 });
+            }
         }
         if self.stroke.is_none() {
             let props = D2D1_STROKE_STYLE_PROPERTIES {
