@@ -90,6 +90,25 @@ inch marks such as `6" PIPE` are all read correctly.
 - Large files: a 66 MB, 1,000,000-row file opens in the grid in about a second, filters in about
   half a second and adds roughly 12 MB of memory over the file itself.
 
+## Compare
+
+Ctrl+Alt+C compares two files side by side, line by line, for checking one revision against
+another (Rev 0 against Rev A).
+
+- With both split views showing a file, it compares those two. Otherwise it asks what to compare
+  the current file with: another open tab, a file on disk, or the file's own saved version when
+  it has unsaved changes. The other file goes on the left and the current one on the right;
+  **Compare: Swap Sides** turns them round.
+- Lines that differ are tinted (red on the left, green on the right) with the changed words
+  marked inside them. Added or removed lines face a hatched gap on the other side, so the two
+  sides always stay level and scroll together. Line numbers are those of the files.
+- F7 / Shift+F7 jump to the next / previous difference; the scrollbars show where they all are.
+  The status bar counts changed, added and removed lines.
+- **Compare: Toggle Ignore Whitespace** and **Toggle Ignore Case** hide cosmetic changes.
+- The compare is read-only. Edit the file in its own tab, then F5 refreshes the compare.
+  Ctrl+Alt+C again (or closing either side) closes it.
+- Large files: two 1,000,000-line files compare in about two seconds.
+
 Everything is reachable from the **command palette** (Ctrl+Shift+P, F1 or the ≡ button), which
 also lists each shortcut. Status-bar items are clickable (line → go to line, encoding, line
 ending, language, tab width, zoom, wrap).
@@ -123,6 +142,8 @@ ending, language, tab width, zoom, wrap).
 | F8 | Focus other view |
 | Ctrl+Shift+R / Ctrl+Shift+M | Record / play macro |
 | Ctrl+Shift+G | CSV grid / text view |
+| Ctrl+Alt+C | Compare with… / close compare |
+| F7 / Shift+F7, F5 | Next / previous difference, refresh compare |
 | Insert | Overtype |
 
 ## Command line
@@ -141,8 +162,9 @@ slate.exe [files...] [-multiInst] [-nosession]
 - Files that mix line-ending styles are unified to the dominant style when saved; the status bar
   shows "(mixed)" and a message says so on open.
 - Folding follows indentation (plus Allman `{` lines), not a full parser.
-- Not included, by agreement: Notepad++ plugins, function list, document map, compare,
-  printing, localization.
+- Not included, by agreement: Notepad++ plugins, function list, document map, printing,
+  localization.
+- The compare view is read-only, does not wrap lines and does not fold.
 - The grid cannot add rows to an empty table or insert columns; use the text view (or paste rows
   past the end).
 - Context menus, file dialogs and message boxes are the native Windows ones.
@@ -160,7 +182,8 @@ cargo test --release
 
 Source layout: `doc.rs` gap buffer + line index · `buffer.rs` selections, undo, folds, bookmarks ·
 `edit.rs` text commands · `csv.rs` table index, filters, sort, Excel clipboard formats ·
-`grid.rs` the grid view · `syntax.rs` lexers · `enc.rs` encodings · `search.rs` find / find in
+`grid.rs` the grid view · `diff.rs` line diff and alignment · `compare.rs` the compare view ·
+`syntax.rs` lexers · `enc.rs` encodings · `search.rs` find / find in
 files · `app.rs` tabs, views, commands, session · `view.rs` layout cache and scrolling ·
 `paint.rs` rendering · `input.rs` keyboard and mouse · `ui.rs` chrome geometry · `gfx.rs`
 Direct2D resources · `sys.rs` clipboard, dialogs · `main.rs` window and message loop.

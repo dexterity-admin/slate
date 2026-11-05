@@ -88,6 +88,10 @@ fn key_cmd(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<Cmd> {
         (true, true, false, v) if v == k('M') => Cmd::MacroPlay,
         (false, false, false, VK_INSERT) => Cmd::Overtype,
         (true, true, false, v) if v == k('G') => Cmd::Grid,
+        (true, false, true, v) if v == k('C') => Cmd::Compare,
+        (false, false, false, 0x76) => Cmd::CompareNext,
+        (false, true, false, 0x76) => Cmd::ComparePrev,
+        (false, false, false, 0x74) => Cmd::CompareRefresh,
         _ => return None,
     })
 }
@@ -266,6 +270,10 @@ impl App {
         }
         if self.grid_active() {
             self.grid_char(ch);
+            return;
+        }
+        if self.in_compare() {
+            self.flash("The compare view is read-only \u{2013} edit the file itself, then F5 refreshes");
             return;
         }
         self.record(Action::Char(ch));

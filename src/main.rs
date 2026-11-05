@@ -3,7 +3,9 @@
 mod anim;
 mod app;
 mod buffer;
+mod compare;
 mod csv;
+mod diff;
 mod doc;
 mod grid;
 mod edit;

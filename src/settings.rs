@@ -19,6 +19,9 @@ pub struct Settings {
     pub animate: bool,
     /// Open .csv / .tsv files in the grid.
     pub csv_grid: bool,
+    /// Compare ignores whitespace / letter case.
+    pub cmp_ws: bool,
+    pub cmp_case: bool,
     /// Release the user chose to skip.
     pub skip_version: String,
     pub recent: Vec<String>,
@@ -39,6 +42,8 @@ static S: RwLock<Settings> = RwLock::new(Settings {
     accent: 0,
     animate: true,
     csv_grid: true,
+    cmp_ws: false,
+    cmp_case: false,
     skip_version: String::new(),
     recent: Vec::new(),
     win: None,
@@ -91,6 +96,8 @@ pub fn load() {
             "accent" => s.accent = v.parse().unwrap_or(0usize).min(crate::gfx::ACCENTS.len() - 1),
             "animate" => s.animate = v != "0",
             "csv_grid" => s.csv_grid = v != "0",
+            "cmp_ws" => s.cmp_ws = v == "1",
+            "cmp_case" => s.cmp_case = v == "1",
             "skip_version" => s.skip_version = v.into(),
             "recent" if !v.is_empty() => s.recent.push(v.into()),
             "window" => {
@@ -114,6 +121,7 @@ pub fn save() {
     out += &format!("show_ws={}\nrestore_session={}\n", b(s.show_ws), b(s.restore_session));
     out += &format!("auto_update={}\nskip_version={}\n", b(s.auto_update), s.skip_version);
     out += &format!("accent={}\nanimate={}\ncsv_grid={}\n", s.accent, b(s.animate), b(s.csv_grid));
+    out += &format!("cmp_ws={}\ncmp_case={}\n", b(s.cmp_ws), b(s.cmp_case));
     if let Some((x, y, w, h, m)) = s.win {
         out += &format!("window={x},{y},{w},{h},{}\n", m as i32);
     }

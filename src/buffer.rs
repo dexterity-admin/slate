@@ -85,6 +85,8 @@ pub struct Buffer {
     pub loading: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
     /// Shown as a table instead of text.
     pub grid: Option<Box<crate::csv::Grid>>,
+    /// One side of a revision compare; such a buffer is read-only.
+    pub diff: Option<Box<crate::diff::DiffView>>,
 }
 
 pub fn display_name(path: &Option<PathBuf>, untitled: usize) -> String {
@@ -123,6 +125,7 @@ impl Buffer {
             label: None,
             loading: None,
             grid: None,
+            diff: None,
         }
     }
 
@@ -211,7 +214,7 @@ impl Buffer {
     /// ascending order, records them as one undo step and maps selections.
     pub fn apply(&mut self, mut changes: Vec<(usize, usize, Vec<u8>)>, kind: EditKind) {
         changes.retain(|(a, b, t)| a != b || !t.is_empty());
-        if changes.is_empty() {
+        if changes.is_empty() || self.diff.is_some() {
             return;
         }
         changes.sort_by_key(|c| c.0);
@@ -379,6 +382,10 @@ impl Buffer {
 
     /// Last line of the block headed by `line`, judged by indentation.
     pub fn fold_end(&self, line: usize) -> Option<usize> {
+        // Folding one side of a compare would break the line alignment.
+        if self.diff.is_some() {
+            return None;
+        }
         let n = self.doc.line_count();
         let base = self.line_indent(line).1?;
         let mut k = line + 1;

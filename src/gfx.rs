@@ -364,6 +364,15 @@ impl Gfx {
         unsafe { self.rt().FillRectangle(&rect(x, y, w, h), self.b(c)) }
     }
 
+    /// Fills with an arbitrary colour at `alpha`.
+    pub fn fill_tint(&self, x: f32, y: f32, w: f32, h: f32, rgb: u32, alpha: f32) {
+        unsafe { self.rt().FillRectangle(&rect(x, y, w, h), &self.tint(rgb, alpha)) }
+    }
+
+    pub fn line_tint(&self, x0: f32, y0: f32, x1: f32, y1: f32, rgb: u32, alpha: f32, w: f32) {
+        unsafe { self.rt().DrawLine(D2D_POINT_2F { x: x0, y: y0 }, D2D_POINT_2F { x: x1, y: y1 }, &self.tint(rgb, alpha), w, None) }
+    }
+
     pub fn fill_round(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: C) {
         let rr = D2D1_ROUNDED_RECT { rect: rect(x, y, w, h), radiusX: r, radiusY: r };
         unsafe { self.rt().FillRoundedRectangle(&rr, self.b(c)) }

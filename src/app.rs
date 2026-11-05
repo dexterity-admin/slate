@@ -51,6 +51,8 @@ pub enum Cmd {
     MacroPlay, Language, Encoding, ReopenEncoding, LineEnding, TabSize, UseTabs, Overtype, NextTab,
     PrevTab, ToggleSession, About, CheckUpdates, InstallUpdate, AutoUpdate, Accent, Animations,
     Grid, GridHeader, GridDelim, GridClear, GridFit, GridCopyHeaders, GridDefault,
+    Compare, CompareFile, CompareSaved, CompareNext, ComparePrev, CompareRefresh, CompareSwap,
+    CompareWs, CompareCase, CompareClose,
 }
 
 pub static COMMANDS: &[(Cmd, &str, &str)] = &[
@@ -133,6 +135,16 @@ pub static COMMANDS: &[(Cmd, &str, &str)] = &[
     (Cmd::GridFit, "Grid: Autofit Column Widths", ""),
     (Cmd::GridCopyHeaders, "Grid: Copy with Headers", ""),
     (Cmd::GridDefault, "Settings: Toggle Opening CSV Files as a Grid", ""),
+    (Cmd::Compare, "Compare: Compare With\u{2026} / Close Compare", "Ctrl+Alt+C"),
+    (Cmd::CompareFile, "Compare: Compare With File\u{2026}", ""),
+    (Cmd::CompareSaved, "Compare: Compare With Saved Version", ""),
+    (Cmd::CompareNext, "Compare: Next Difference", "F7"),
+    (Cmd::ComparePrev, "Compare: Previous Difference", "Shift+F7"),
+    (Cmd::CompareRefresh, "Compare: Refresh", "F5"),
+    (Cmd::CompareSwap, "Compare: Swap Sides", ""),
+    (Cmd::CompareWs, "Compare: Toggle Ignore Whitespace", ""),
+    (Cmd::CompareCase, "Compare: Toggle Ignore Case", ""),
+    (Cmd::CompareClose, "Compare: Close Compare", ""),
     (Cmd::Language, "Document: Set Language…", ""),
     (Cmd::Encoding, "Document: Convert Encoding…", ""),
     (Cmd::ReopenEncoding, "Document: Reopen with Encoding…", ""),
@@ -244,6 +256,7 @@ pub enum PalAct {
     TabSize(usize),
     Accent(usize),
     Delim(u8),
+    Compare(u32),
 }
 
 pub struct PalItem {
@@ -431,6 +444,8 @@ pub struct App {
     pub exiting_for_update: bool,
     /// Grid part under the mouse that shows a hover state.
     pub grid_hover: crate::grid::GHit,
+    /// Last scroll state both compare sides were synced to.
+    pub cmp_sync: Option<(usize, usize, f32)>,
 }
 
 pub fn invalidate(hwnd: HWND) {
@@ -491,6 +506,7 @@ impl App {
             anim_timer: false,
             exiting_for_update: false,
             grid_hover: crate::grid::GHit::None,
+            cmp_sync: None,
         }
     }
 
@@ -540,7 +556,7 @@ impl App {
         id
     }
 
-    fn add_tab(&mut self, v: usize, id: u32) {
+    pub(crate) fn add_tab(&mut self, v: usize, id: u32) {
         let vw = &mut self.views[v];
         let at = if vw.tabs.is_empty() { 0 } else { vw.active + 1 };
         vw.tabs.insert(at, Tab { buf: id, top: 0, sub: 0, x: 0.0 });
@@ -773,6 +789,7 @@ impl App {
             }
         }
         self.views[v].tabs.remove(idx);
+        let partner = self.bufs[i].diff.as_ref().map(|d| d.partner).filter(|_| !elsewhere);
         if !elsewhere {
             let i = self.bi(id);
             if let Some(p) = &self.bufs[i].path {
@@ -800,6 +817,10 @@ impl App {
             } else {
                 self.new_file();
             }
+        }
+        // The two sides of a compare close together.
+        if let Some((pv, pi)) = partner.and_then(|p| self.find_open_id(p)) {
+            return self.close_tab(pv, pi);
         }
         self.after_switch();
         true
@@ -1492,6 +1513,7 @@ impl App {
                 self.cache.clear();
             }
             PalAct::Delim(d) => self.grid_set_delim(d),
+            PalAct::Compare(id) => self.compare_buf(id),
             PalAct::TabSize(n) => {
                 settings::get_mut().tab_size = n;
                 for b in self.bufs.iter_mut() {
@@ -1581,7 +1603,60 @@ impl App {
             self.flash("Open the grid first \u{2013} Ctrl+Shift+G");
             return;
         }
+        if self.in_compare() {
+            let edits = matches!(
+                c,
+                Cmd::Save | Cmd::SaveAs | Cmd::Cut | Cmd::Paste | Cmd::Undo | Cmd::Redo | Cmd::Replace | Cmd::ToggleComment
+                    | Cmd::Comment | Cmd::Uncomment | Cmd::Duplicate | Cmd::DeleteLine | Cmd::MoveUp | Cmd::MoveDown
+                    | Cmd::Upper | Cmd::Lower | Cmd::TitleCase | Cmd::SortAsc | Cmd::SortDesc | Cmd::Unique | Cmd::Reverse
+                    | Cmd::Trim | Cmd::Join | Cmd::TabsToSpaces | Cmd::SpacesToTabs | Cmd::MacroPlay | Cmd::Encoding
+                    | Cmd::ReopenEncoding | Cmd::LineEnding | Cmd::Grid | Cmd::ToggleFold | Cmd::FoldAll
+            );
+            if edits {
+                self.flash("The compare view is read-only \u{2013} edit the file itself, then F5 refreshes");
+                return;
+            }
+            if c == Cmd::Reload {
+                return self.cmp_refresh();
+            }
+        }
         match c {
+            Cmd::Compare => {
+                self.compare_with();
+                changed = false;
+            }
+            Cmd::CompareFile => {
+                self.compare_file();
+                changed = false;
+            }
+            Cmd::CompareSaved => {
+                self.compare_saved();
+                changed = false;
+            }
+            Cmd::CompareNext | Cmd::ComparePrev => {
+                self.cmp_step(c == Cmd::CompareNext);
+                changed = false;
+            }
+            Cmd::CompareRefresh => {
+                if self.has_compare() {
+                    self.cmp_refresh();
+                } else {
+                    self.flash("Open a compare first \u{2013} Ctrl+Alt+C");
+                }
+                changed = false;
+            }
+            Cmd::CompareSwap => {
+                self.cmp_swap();
+                changed = false;
+            }
+            Cmd::CompareWs | Cmd::CompareCase => {
+                self.cmp_toggle_opt(c == Cmd::CompareCase);
+                changed = false;
+            }
+            Cmd::CompareClose => {
+                self.close_compare();
+                changed = false;
+            }
             Cmd::Grid => {
                 self.toggle_grid();
                 changed = false;

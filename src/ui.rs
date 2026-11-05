@@ -23,6 +23,9 @@ pub const FB_SEARCH: usize = 9;
 
 /// Short file-type label and colour shown on a tab, from the extension.
 pub fn badge(b: &crate::buffer::Buffer) -> Option<(String, u32)> {
+    if b.diff.is_some() {
+        return Some(("DIFF".into(), 0xD29922));
+    }
     if b.label.is_some() {
         return Some(("FIND".into(), 0x8B95A7));
     }

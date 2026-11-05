@@ -26,6 +26,7 @@ impl App {
             self.gfx.rt().BeginDraw();
             self.gfx.rt().Clear(Some(&self.gfx.color(C::Bg)));
         }
+        self.cmp_sync_views();
         let views = if self.split { 2 } else { 1 };
         for v in 0..views {
             self.paint_view(v);
@@ -305,6 +306,13 @@ impl App {
                 self.gfx.fill(vx, row.y, vw - SCROLL_W, row_h, C::CurLine);
             }
             let ox = tx - sx;
+            if let Some(d) = &b.diff {
+                self.paint_diff_row(d, row.line, vx, row.y, vw - SCROLL_W, row_h);
+                let rgb = if d.left { crate::compare::RED } else { crate::compare::GREEN };
+                for &(_, a, z) in d.marks_on(row.line) {
+                    self.fill_range_tint(l, a as usize, z as usize, ox, row.y, rgb, if self.gfx.dark { 0.38 } else { 0.30 });
+                }
+            }
             // Selections.
             for s in &b.sels {
                 if s.is_empty() || s.hi() < ls || s.lo() > le + 1 {
@@ -401,7 +409,17 @@ impl App {
             if b.bookmarks.binary_search(&row.line).is_ok() {
                 g.fill_round(vx + 5.0, row.y + lh / 2.0 - 4.5, 9.0, 9.0, 4.5, C::Accent);
             }
-            let num = (row.line + 1).to_string();
+            // Compare sides number lines as in their files; filler has none.
+            let num = match &b.diff {
+                Some(d) => {
+                    self.paint_diff_gutter(d, row.line, vx, row.y, row.rows as f32 * lh);
+                    match d.nums.get(row.line).copied().unwrap_or(0) {
+                        0 => String::new(),
+                        n => n.to_string(),
+                    }
+                }
+                None => (row.line + 1).to_string(),
+            };
             let fg = if row.line == caret_line { C::Fg } else { C::Faint };
             g.text(&num, num_fmt, vx + 14.0, row.y, gw - 14.0 - 22.0, lh, fg);
             let folded = b.is_folded(row.line);
@@ -424,24 +442,38 @@ impl App {
                 g.fill(x + 2.0, by, SCROLL_W - 4.0, 2.0, C::Accent);
             }
         }
+        if let Some(d) = &b.diff {
+            self.paint_diff_ticks(d, vx + vw - SCROLL_W, ty, th);
+        }
         let _ = wrap;
     }
 
     fn fill_range(&self, l: &crate::app::LineLayout, a: usize, z: usize, ox: f32, oy: f32, c: C) {
+        for (x, y, w) in self.range_rects(l, a, z) {
+            self.gfx.fill(ox + x, oy + y, w.max(2.0), self.gfx.line_h, c);
+        }
+    }
+
+    fn fill_range_tint(&self, l: &crate::app::LineLayout, a: usize, z: usize, ox: f32, oy: f32, rgb: u32, alpha: f32) {
+        for (x, y, w) in self.range_rects(l, a, z) {
+            self.gfx.fill_tint(ox + x, oy + y, w.max(2.0), self.gfx.line_h, rgb, alpha);
+        }
+    }
+
+    /// Layout-relative rectangles (x, y, width) covering bytes a..z of a line.
+    fn range_rects(&self, l: &crate::app::LineLayout, a: usize, z: usize) -> Vec<(f32, f32, f32)> {
         let (a16, z16) = (l.to16(a), l.to16(z));
         if z16 <= a16 {
-            return;
+            return Vec::new();
         }
         let mut m = [DWRITE_HIT_TEST_METRICS::default(); 16];
         let mut n = 0u32;
         unsafe {
             if l.layout.HitTestTextRange(a16, z16 - a16, 0.0, 0.0, Some(&mut m), &mut n).is_err() {
-                return;
+                return Vec::new();
             }
         }
-        for r in &m[..(n as usize).min(16)] {
-            self.gfx.fill(ox + r.left, oy + r.top, r.width.max(2.0), self.gfx.line_h, c);
-        }
+        m[..(n as usize).min(16)].iter().map(|r| (r.left, r.top, r.width)).collect()
     }
 
     fn xy16(&self, l: &crate::app::LineLayout, i16: u32) -> (f32, f32) {
@@ -462,7 +494,7 @@ impl App {
     fn paint_status(&mut self) {
         let y = self.h - STATUS_H;
         let mut segs: Vec<(String, u8)> = Vec::new();
-        let grid = self.grid_active().then(|| self.grid_status());
+        let grid = if self.grid_active() { Some(self.grid_status()) } else { self.cmp_status() };
         {
             let b = self.cur_ref();
             let p = b.caret();
@@ -506,8 +538,11 @@ impl App {
             if grid.is_none() {
                 segs.push((format!("{}: {}", if s.use_tabs { "Tabs" } else { "Spaces" }, s.tab_size), 1));
             }
-            segs.push((b.enc.name().to_string(), 2));
-            segs.push((format!("{}{}", b.eol.name(), if b.mixed_eol { " (mixed)" } else { "" }), 3));
+            // Encoding and line endings belong to the files, not to a compare.
+            if b.diff.is_none() {
+                segs.push((b.enc.name().to_string(), 2));
+                segs.push((format!("{}{}", b.eol.name(), if b.mixed_eol { " (mixed)" } else { "" }), 3));
+            }
             segs.push((LANGS[b.lang].name.to_string(), 4));
         }
         let g = &self.gfx;

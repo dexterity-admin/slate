@@ -52,7 +52,8 @@ impl App {
     }
 
     pub fn wrap_width(&self, v: usize) -> Option<f32> {
-        settings::get().wrap.then(|| (self.text_rect(v).2 - 6.0).max(40.0))
+        // Compare sides never wrap, so their lines stay level.
+        (settings::get().wrap && self.buf_of(v).diff.is_none()).then(|| (self.text_rect(v).2 - 6.0).max(40.0))
     }
 
     pub fn vis_rows(&self, v: usize) -> usize {
