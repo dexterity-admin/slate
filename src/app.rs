@@ -775,6 +775,7 @@ impl App {
                 return;
             }
             LoadMsg::Done { enc, eol, mixed } => {
+                crate::trace("loaded");
                 let b = &mut self.bufs[i];
                 b.enc = enc;
                 b.eol = eol;
@@ -885,19 +886,29 @@ impl App {
         std::thread::spawn(move || {
             let text = text;
             let parts = unsafe { [std::slice::from_raw_parts(text.0, text.1), std::slice::from_raw_parts(text.2, text.3)] };
-            // A temporary file first, so a failed save never leaves half a file.
-            let tmp = path.with_file_name(format!("{}.slate-saving", path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
-            let r = std::fs::File::create(&tmp)
-                .and_then(|f| {
+            let write = |to: &Path| {
+                std::fs::File::create(to).and_then(|f| {
                     let mut w = std::io::BufWriter::with_capacity(4 << 20, f);
                     enc::write_encoded(&mut w, parts, enc, eol, &mut |n| progress.store(n as u64, Ordering::Relaxed))?;
                     w.into_inner().map_err(|e| e.into_error())?.sync_all()
                 })
-                .and_then(|_| std::fs::rename(&tmp, &path))
-                .map_err(|e| {
+            };
+            // A temporary file first, so a failed save never leaves half a
+            // file; when the disk has no room for a second copy, the file
+            // is written over in place instead.
+            let tmp = path.with_file_name(format!("{}.slate-saving", path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
+            let r = match write(&tmp).and_then(|_| replace_file(&tmp, &path)) {
+                Ok(()) => Ok(()),
+                Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
-                    e.to_string()
-                });
+                    if matches!(e.raw_os_error(), Some(112) | Some(39)) {
+                        progress.store(0, Ordering::Relaxed);
+                        write(&path).map_err(|e| e.to_string())
+                    } else {
+                        Err(e.to_string())
+                    }
+                }
+            };
             let p = Box::into_raw(Box::new(Saved { id, path, result: r }));
             unsafe {
                 if PostMessageW(HWND(hwnd as *mut _), WM_SAVED, WPARAM(0), LPARAM(p as isize)).is_err() {
@@ -912,6 +923,7 @@ impl App {
     }
 
     pub fn on_saved(&mut self, s: Saved) {
+        crate::trace(&format!("saved {:?}", s.result));
         if let Some(i) = self.bufs.iter().position(|b| b.id == s.id) {
             self.bufs[i].saving = None;
             match s.result {
@@ -2614,6 +2626,24 @@ mod tests {
         assert!(fuzzy("close tab", "file: close other tabs").is_some());
         assert_eq!(title_case("hello wORLD-x"), "Hello World-X");
         assert_eq!(strip_unc(PathBuf::from(r"\\?\D:\a")), PathBuf::from(r"D:\a"));
+    }
+}
+
+/// Moves the finished temporary file over the target. A file just written
+/// is often held for a moment by antivirus or the search indexer, so a
+/// refused rename is retried for a few seconds before it counts as failed.
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(tmp, path) {
+            Ok(()) => return Ok(()),
+            // Access denied / sharing violation: someone has it open briefly.
+            Err(e) if matches!(e.raw_os_error(), Some(5) | Some(32)) && tries < 60 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 

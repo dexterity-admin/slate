@@ -25,6 +25,18 @@ public class BW {
 "@
 [void][BW]::SetProcessDPIAware()
 $env:SLATE_DATA_DIR = "U:\Vikram\_Claude_Work\temp\slate-bigdata"
+# Slate notes when loading and saving finish in this file.
+$trace = Join-Path $env:TEMP "slate-bigfile-trace.txt"
+Remove-Item $trace -ErrorAction SilentlyContinue
+$env:SLATE_TRACE = $trace
+function Wait-Trace([string]$what) {
+    $t = [Diagnostics.Stopwatch]::StartNew()
+    while ($t.ElapsedMilliseconds -lt 300000) {
+        if ((Test-Path $trace) -and (Select-String -Path $trace -Pattern " $what$" -Quiet)) { return $t.ElapsedMilliseconds }
+        Start-Sleep -Milliseconds 50
+    }
+    return -1
+}
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $p = Start-Process -FilePath $Exe -ArgumentList ("-multiInst -nosession `"$File`"") -PassThru
 Remove-Item Env:SLATE_DATA_DIR
@@ -47,8 +59,9 @@ function Wait-Idle([int]$quietMs = 600) {
     }
     return @([int]($t.ElapsedMilliseconds - $quiet), $peak)
 }
-$r = Wait-Idle 1500
-"loaded in $($sw.ElapsedMilliseconds - 1500) ms; peak working set $([math]::Round($r[1]/1MB)) MB; now $([math]::Round($p.WorkingSet64/1MB)) MB; private $([math]::Round($p.PrivateMemorySize64/1MB)) MB"
+[void](Wait-Trace "loaded")
+$p.Refresh()
+"loaded in $($sw.ElapsedMilliseconds) ms; working set $([math]::Round($p.WorkingSet64/1MB)) MB; private $([math]::Round($p.PrivateMemorySize64/1MB)) MB"
 foreach ($s in $Steps.Split('|')) {
     if (-not $s) { continue }
     $kind, $arg = $s.Split(':', 2)
@@ -69,6 +82,7 @@ foreach ($s in $Steps.Split('|')) {
             "  typed '$arg': $($t0.ElapsedMilliseconds - 400) ms"
         }
         'w' { Start-Sleep -Milliseconds ([int]$arg) }
+        'saved' { $ms = Wait-Trace "saved.*"; "  save finished after $ms ms: " + ((Get-Content $trace | Select-String 'saved') -join ' ') }
         'shot' {
             [void][BW]::UpdateWindow($hw)
             $rc = New-Object BW+RECT; [void][BW]::GetWindowRect($hw, [ref]$rc)
