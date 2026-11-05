@@ -24,7 +24,8 @@ public class BW {
 }
 "@
 [void][BW]::SetProcessDPIAware()
-$env:SLATE_DATA_DIR = "U:\Vikram\_Claude_Work\temp\slate-bigdata"
+# A data folder of its own, so the test never touches the real settings.
+$env:SLATE_DATA_DIR = Join-Path $env:TEMP "slate-bigdata"
 # Slate notes when loading and saving finish in this file.
 $trace = Join-Path $env:TEMP "slate-bigfile-trace.txt"
 Remove-Item $trace -ErrorAction SilentlyContinue

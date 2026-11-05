@@ -1,34 +1,51 @@
-<p align="center"><img src="res/slate-512.png" width="128" alt="Slate"></p>
+<p align="center"><img src="docs/img/logo.png" width="112" alt="Slate"></p>
 
-# Slate
+<h1 align="center">Slate</h1>
 
-A small, fast text editor for Windows: the everyday Notepad++ feature set, plus a CSV grid,
-revision compare and team features, in a single executable under 1 MB with a modern, fully
-custom-drawn interface.
+<p align="center"><b>A tiny, fast text editor for engineering work on Windows.</b><br>
+The everyday Notepad++ feature set in one program of about 1 MB, with a CSV grid that pastes into
+Excel as real columns, side-by-side revision compare, live co-editing over the office network and
+files up to a gigabyte.</p>
 
-- **[Download the installer](https://github.com/dexterity-admin/slate/releases/latest)** (per-user, no admin rights) or the portable zip; Slate keeps itself up to date
-- Direct2D / DirectWrite rendering, light and dark themes (follows Windows on first run), seven accent colours
-- Its own vector icon set, file-type badges on tabs, smooth scrolling and gliding tab and panel transitions
-- Zero CPU when idle: animations run only while something moves, and the caret is the Windows system caret, so blinking costs no repaints
+<p align="center">
+<a href="https://github.com/dexterity-admin/slate/releases/latest"><b>Download for Windows</b></a> ·
+<a href="https://dexterity-admin.github.io/slate/">Website</a> ·
+<a href="#keyboard-shortcuts-notepad-layout-where-it-has-one">Shortcuts</a>
+</p>
+
+<p align="center"><img src="docs/img/compare.png" width="860" alt="Two revisions of a piping component file compared side by side"></p>
+
+- **Installs per user, no admin rights** (or use the portable zip), and keeps itself up to date:
+  signed releases, and a failed update puts the previous version back.
+- **Zero CPU when idle** – nothing animates unless it moves, and the caret blinks without repaints.
+- **Direct2D everywhere** – light and dark themes, seven accents, smooth scrolling, gliding tabs,
+  file-type badges, an optional translucent window.
+
+| | |
+|---|---|
+| <img src="docs/img/grid.png" alt="CSV grid"> **CSV grid** – filter, sort and edit registers; copy to Excel as columns | <img src="docs/img/coedit.png" alt="Co-editing"> **Co-editing** – two people, one file, named carets, no server |
+| <img src="docs/img/bigfile.png" alt="1 GB log"> **Big files** – a 1 GB log shows at once and searches in a second | <img src="docs/img/dark-acrylic.png" alt="Dark theme"> **Dark theme, acrylic** – and an AI panel for your own server |
 
 ## Measured against Notepad++ (same machine, same files)
 
 `tools\bench.ps1`; `WorkingSet64` and `PrivateMemorySize64` from `Get-Process` after 26 s; idle CPU = %
-of one core over 16–26 s after launch; startup CPU = CPU time used in the first 4 s.
+of one core over 16–26 s after launch; startup CPU = CPU time used in the first 4 s. Slate 1.5.0
+with team features on, Notepad++ 8.x, November 2026.
 
 | | WorkingSet64 | PrivateMemorySize64 | Startup CPU | Idle CPU |
 |---|---|---|---|---|
-| Slate, empty | **23.6 MB** | 31.7 MB | **547 ms** | **0 %** |
-| Notepad++ 8.x, empty | 47.5 MB | 31.3 MB | 3,219 ms | 1.09 % |
-| Slate, 2.04 MB file | **28.0 MB** | **35.0 MB** | **516 ms** | **0 %** |
-| Notepad++, 2.04 MB file | 52.5 MB | 36.1 MB | 3,594 ms | 0.78 % |
-| Slate, 10.2 MB file | **36.7 MB** | **43.8 MB** | **938 ms** | **0 %** |
-| Notepad++, 10.2 MB file | 71.0 MB | 54.7 MB | 3,141 ms | 1.72 % |
-| Executable size | **602 KB** | | | |
+| Slate, empty | **25.6 MB** | 33.4 MB | **781 ms** | **0 %** |
+| Notepad++, empty | 46.8 MB | 31.0 MB | 906 ms | 0.31 % |
+| Slate, 2 MB file | **28.3 MB** | 36.0 MB | **844 ms** | **0 %** |
+| Notepad++, 2 MB file | 51.8 MB | 35.6 MB | 984 ms | 1.09 % |
+| Slate, 10 MB file | **38.6 MB** | **45.2 MB** | **1,062 ms** | **0 %** |
+| Notepad++, 10 MB file | 70.6 MB | 54.4 MB | 2,500 ms | 0.31 % |
+| Executable size | **1.0 MB** | | | |
 | notepad++.exe / full install | 8.47 MB / 31 MB | | | |
 
-Private memory on an empty window (~31.7 MB) is the Direct2D/GPU floor that was accepted
-when Direct2D was chosen; it is level with Notepad++ and Slate pulls ahead as files grow.
+Private memory on an empty window (~33 MB) is the Direct2D/GPU floor that was accepted when
+Direct2D was chosen; it is level with Notepad++ and Slate pulls ahead as files grow. A 1 GB file
+takes about its own size in memory.
 
 ## Features
 
@@ -112,9 +129,9 @@ another (Rev 0 against Rev A).
 
 ## Team features
 
-Everything runs through one **team folder** on the file server that everyone can write to
-(**Team: Set Team Folder**). There is no server program to install and Slate opens no network
-ports, so firewalls are not involved. Without a team folder these features are off.
+Slates on the same network **find each other by themselves** and talk directly – there is nothing
+to set up and no server to run. Your name comes from Windows (**Team: Set Your Display Name** can
+change it). **Settings: Toggle Team Features (LAN)** turns it all off.
 
 - **Who's online** – avatars in the title bar; click them to see who has which file open and open
   it. Tabs show a coloured dot for each colleague who has the same file open (solid when they have
@@ -124,18 +141,49 @@ ports, so firewalls are not involved. Without a team folder these features are o
 - **Locks** – **Team: Lock / Unlock This File** makes the file read-only for everyone else until
   you unlock it or close it.
 - **Co-editing** – Ctrl+Shift+E on a shared file starts co-editing; colleagues who have it open are
-  offered to join with the same key. Everyone types at once and sees the others' named carets;
-  anyone can save. Changes travel through an append-only log in the team folder and are merged by
-  operational transformation, so nobody's typing is lost.
-- **Library** – snippets, shared macros and find / replace presets kept in
-  `<team folder>\library` (**Library:** commands insert, run, use and save them).
-- **Instant search** (Ctrl+Shift+I) – searches an index of the project folders: file names and text,
-  case-insensitive, results like Find in Files. The index is kept by one always-on PC running
-  `slate.exe --hub` (for example from Task Scheduler at log-on), which re-reads only changed files
-  every 10 minutes. List the folders to index, one per line, in `<team folder>\index\roots.txt`.
+  offered to join with the same key. Everyone types at once and sees the others' named carets and
+  selections; anyone can save. One participant puts the changes in order and everyone keeps the
+  ordered history, so when that person leaves or their PC drops off, the others choose a new one,
+  catch up and resend whatever was not confirmed – nothing typed is lost. Undo takes back only your
+  own changes, wherever the others typed.
+- **Library** – snippets, shared macros and find / replace presets (**Library:** commands insert,
+  run, use, save and delete them). Every PC keeps a copy and the copies sync: the newest version of
+  each item wins, and deletions travel too.
+- **Instant search** (Ctrl+Shift+I) – file names and text across the project folders, results like
+  Find in Files. One always-on PC runs `slate.exe --hub "\\server\projects\P-1001" ...` (for example
+  from Task Scheduler at log-on); it indexes those folders on its own disk, re-reads only changed
+  files every 10 minutes and answers every Slate's searches.
 
-Mapped drive letters are translated to their `\\server\share` paths, so everyone names a file the
-same way. If the team folder cannot be reached, team features pause and resume by themselves.
+How it connects: each Slate announces itself on UDP port 47613 (multicast and broadcast) and keeps
+one TCP connection to each other Slate, on a port Windows picks. The first time, Windows Firewall
+may ask whether Slate may use the network: allowing it on private networks lets colleagues connect
+to you; if it is not allowed you can still connect to them. Mapped drive letters are translated to
+their `\\server\share` paths, so everyone names a file the same way.
+
+## Big files
+
+Files over 16 MB stream in: the first screen shows within a second and you can read and scroll while
+the rest arrives (read-only until it has); a 1 GB file takes about 10–15 s to read from a hard disk.
+Plain-text search runs through a gigabyte in about a second; a regular expression searches a huge
+file 64 MB at a time. Huge files (64 MB and up) save in the background, through a temporary file
+when the disk has room, and skip syntax colouring, crash backups and live match counts.
+
+**Follow mode** (Ctrl+Shift+W, or **Follow** in the status bar of a `.log`) shows a log's new lines
+as they are written, keeping to the end unless you scroll up; a rotated or truncated log reloads.
+
+## AI assistant
+
+**View: AI Assistant Panel** (Ctrl+Shift+A) – ask about the file or the selection, or use *Explain*,
+*Summarise* and *Fix / rewrite*, then insert or copy the answer. It talks only to your company's own
+AI server (**AI: Set Company AI Server**, e.g. `http://ai-server:11434`; anything that offers the
+common chat-completions interface, such as Ollama, vLLM or LiteLLM). Until a server is set the panel
+says *Coming soon* and nothing is sent anywhere.
+
+## Appearance
+
+Light and dark themes, seven accent colours (**View: Accent Colour**), and **View: Toggle
+Translucent Window (Acrylic)** for a frosted title bar, tab strip and status bar (the editor stays
+solid). A short splash with the logo shows when Slate opens or receives files.
 
 Everything is reachable from the **command palette** (Ctrl+Shift+P, F1 or the ≡ button), which
 also lists each shortcut. Status-bar items are clickable (line → go to line, encoding, line
@@ -173,7 +221,9 @@ ending, language, tab width, zoom, wrap).
 | Ctrl+Alt+C | Compare with… / close compare |
 | F7 / Shift+F7, F5 | Next / previous difference, refresh compare |
 | Ctrl+Shift+E | Co-edit this file (start / join / leave) |
-| Ctrl+Shift+I | Instant search in the team index |
+| Ctrl+Shift+I | Instant search (through the search hub) |
+| Ctrl+Shift+W | Follow the file as it grows (tail) |
+| Ctrl+Shift+A | AI assistant panel |
 | Insert | Overtype |
 
 ## Command line
@@ -185,7 +235,8 @@ slate.exe [files...] [-multiInst] [-nosession]
 `-multiInst` starts a separate window instead of handing files to the running one;
 `-nosession` neither restores nor saves the session or backups.
 `slate.exe <file> <milliseconds>` is benchmark mode (closes itself, touches no settings).
-`slate.exe --hub [--once]` keeps the team search index current (no window; `--once` runs one pass).
+`slate.exe --hub <folder> [<folder> ...] [--once]` runs the search hub: no window, indexes the
+folders every 10 minutes and answers searches (the folders are remembered; `--once` runs one pass).
 
 ## Known limits
 
@@ -195,11 +246,13 @@ slate.exe [files...] [-multiInst] [-nosession]
 - Folding follows indentation (plus Allman `{` lines), not a full parser.
 - Not included, by agreement: Notepad++ plugins, function list, document map, printing,
   localization.
-- The compare view is read-only, does not wrap lines and does not fold.
-- While co-editing, a colleague's change clears your undo history (its positions no longer hold).
-  Co-editing follows each other within about a second, depending on the file server.
+- The compare view is read-only, does not wrap lines and does not fold; it compares files of up
+  to 256 MB each.
+- Co-editing works on files up to 128 MB. If the network splits a session in two and both halves
+  carry on, the half with fewer changes reloads the other's text when they meet again.
 - Instant search is literal text (no regular expressions through the index) and checks at most
   3,000 candidate files per search.
+- Unsaved changes in huge files are not backed up while you work; closing Slate asks about them.
 - The grid cannot add rows to an empty table or insert columns; use the text view (or paste rows
   past the end).
 - Context menus, file dialogs and message boxes are the native Windows ones.
@@ -218,12 +271,15 @@ cargo test --release
 Source layout: `doc.rs` gap buffer + line index · `buffer.rs` selections, undo, folds, bookmarks ·
 `edit.rs` text commands · `csv.rs` table index, filters, sort, Excel clipboard formats ·
 `grid.rs` the grid view · `diff.rs` line diff and alignment · `compare.rs` the compare view ·
-`team.rs` presence and locks · `ot.rs` + `collab.rs` co-editing · `library.rs` team library ·
-`index.rs` search index and hub ·
+`net.rs` + `wire.rs` LAN discovery, connections and messages · `team.rs` presence and locks ·
+`ot.rs` + `collab.rs` co-editing · `library.rs` team library · `index.rs` search index and hub ·
+`follow.rs` follow mode · `ai.rs` assistant panel ·
 `syntax.rs` lexers · `enc.rs` encodings · `search.rs` find / find in
 files · `app.rs` tabs, views, commands, session · `view.rs` layout cache and scrolling ·
 `paint.rs` rendering · `input.rs` keyboard and mouse · `ui.rs` chrome geometry · `gfx.rs`
 Direct2D resources · `sys.rs` clipboard, dialogs · `main.rs` window and message loop.
 
 Test tools: `tools\drive.ps1` drives a live window and takes screenshots; `tools\duo.ps1` drives two
-windows as two team members sharing a team folder; `tools\bench.ps1` produces the table above.
+windows as two team members on the LAN; `tools\bigfile.ps1` times opening, searching and saving a
+big file; `tools\rollback-test.ps1` runs crash, hang and good updates through the real updater;
+`tools\bench.ps1` produces the table above. The website is `docs\index.html` (GitHub Pages).

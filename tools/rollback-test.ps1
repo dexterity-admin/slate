@@ -6,7 +6,7 @@
 #   good  - a working Slate                   -> it takes over, the old one exits
 param(
     [string]$Exe = "$PSScriptRoot\..\target\release\slate.exe",
-    [string]$Work = "D:\Vikram\projects\npp-lite\tmp\rollback-test"
+    [string]$Work = "$PSScriptRoot\..\tmp\rollback-test"
 )
 $ErrorActionPreference = "Stop"
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue

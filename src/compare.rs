@@ -12,6 +12,8 @@ use std::path::PathBuf;
 pub const RED: u32 = 0xF85149;
 pub const GREEN: u32 = 0x3FB950;
 const GREY: u32 = 0x8B949E;
+/// Largest file compared side by side.
+const CMP_MAX: usize = 256 << 20;
 
 fn opts() -> Opts {
     let s = settings::get();
@@ -71,6 +73,10 @@ impl App {
             Ok(x) => x,
             Err(e) => return self.flash(&e),
         };
+        // Both aligned copies live in memory next to the originals.
+        if ta.len().max(tb.len()) > CMP_MAX {
+            return self.flash("These files are too large to compare side by side (256 MB each at most)");
+        }
         self.close_compare();
         let o = opts();
         self.cmp_busy(ta.len() + tb.len());
