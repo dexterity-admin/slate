@@ -333,7 +333,7 @@ impl App {
                     Msg::LibWant { items } => self.lib_on_want(from, items),
                     Msg::LibItem { meta, body } => self.lib_on_item(meta, body),
                     Msg::SearchRes { qid, text } => self.search_result(qid, text),
-                    Msg::SearchReq { .. } | Msg::Hello { .. } => {}
+                    Msg::SearchReq { .. } | Msg::Hello { .. } | Msg::Bye => {}
                     m => self.collab_on_msg(from, m),
                 }
             }

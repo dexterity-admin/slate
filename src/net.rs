@@ -76,6 +76,9 @@ struct Registry {
     /// Where each peer said it listens (from beacons).
     addrs: HashMap<u64, SocketAddr>,
     connecting: HashSet<u64>,
+    /// Connections being wound down (still read, never written), by
+    /// serial, so shutting down closes them too.
+    spare: HashMap<u64, TcpStream>,
 }
 
 struct Shared {
@@ -319,10 +322,19 @@ impl Drop for Net {
     fn drop(&mut self) {
         self.sh.stop.store(true, Ordering::Relaxed);
         let mut reg = self.sh.reg.lock().unwrap();
+        // Say goodbye on each connection: the writer sends it after what is
+        // already queued and then closes its half, and the other side treats
+        // the connection as closed at once. (A crash closes the sockets
+        // anyway, and keep-alive notices a PC that vanished.)
+        let bye = Arc::new(Msg::Bye.frame());
         for c in reg.conns.values() {
-            let _ = c.sock.shutdown(std::net::Shutdown::Both);
+            let _ = c.tx.send(bye.clone());
+        }
+        for s in reg.spare.values() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
         }
         reg.conns.clear();
+        reg.spare.clear();
         drop(reg);
         // Unblock accept().
         let _ = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], self.sh.port)), Duration::from_millis(200));
@@ -379,11 +391,24 @@ fn heard(sh: &Arc<Shared>, b: Beacon, from: SocketAddr) {
     }
     let sh = sh.clone();
     spawn("slate-connect", move || {
-        let r = TcpStream::connect_timeout(&addr, Duration::from_secs(3));
-        sh.reg.lock().unwrap().connecting.remove(&b.id);
-        if let Ok(s) = r {
-            handshake(sh, s, true);
+        // The lower id connects; the higher one only if that has not
+        // happened after a while (its firewall may block the other way).
+        // So two Slates rarely connect to each other at the same moment.
+        if sh.me > b.id {
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(100));
+                if sh.stop.load(Ordering::Relaxed) || sh.reg.lock().unwrap().conns.contains_key(&b.id) {
+                    sh.reg.lock().unwrap().connecting.remove(&b.id);
+                    return;
+                }
+            }
         }
+        // Still "connecting" until the handshake is through, so a repeated
+        // beacon meanwhile does not open a second connection.
+        if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            handshake(sh.clone(), s, true);
+        }
+        sh.reg.lock().unwrap().connecting.remove(&b.id);
     });
 }
 
@@ -408,48 +433,63 @@ fn handshake(sh: Arc<Shared>, mut s: TcpStream, initiated: bool) {
     let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>();
     let Ok(wsock) = s.try_clone() else { return };
     let Ok(ksock) = s.try_clone() else { return };
-    let fresh = {
+    // Both sides connected at once: on both PCs the connection opened by
+    // the lower id is kept. The other is not cut off but wound down: what
+    // was already sent on it is still read, and our side stops writing.
+    let (kept, fresh) = {
         let mut reg = sh.reg.lock().unwrap();
         let keep_new = match reg.conns.get(&id) {
             None => true,
-            // Both sides connected at once: on both PCs the connection
-            // opened by the lower id wins.
             Some(old) => old.initiator != initiator && initiator == sh.me.min(id),
         };
-        if !keep_new {
-            let _ = s.shutdown(std::net::Shutdown::Both);
-            return;
+        if keep_new {
+            // Dropping the old sender lets its writer finish what is queued
+            // and then close its half; its socket is kept to close at exit.
+            let old = reg.conns.insert(id, Conn { serial, initiator, tx, sock: ksock });
+            let fresh = old.is_none();
+            if let Some(o) = old {
+                reg.spare.insert(o.serial, o.sock);
+            }
+            (true, fresh)
+        } else {
+            if let Ok(k) = s.try_clone() {
+                reg.spare.insert(serial, k);
+            }
+            (false, false)
         }
-        let old = reg.conns.insert(id, Conn { serial, initiator, tx, sock: ksock });
-        if let Some(o) = &old {
-            let _ = o.sock.shutdown(std::net::Shutdown::Both);
-        }
-        old.is_none()
     };
-    // Writer: frames queued by the editor go out in order.
-    {
+    if kept {
+        // Writer: frames queued by the editor go out in order; when its
+        // queue closes it says so by closing the writing half.
         let mut w = wsock;
         spawn("slate-write", move || {
             for f in rx {
                 if w.write_all(&f).is_err() {
                     let _ = w.shutdown(std::net::Shutdown::Both);
-                    break;
+                    return;
                 }
             }
+            let _ = w.shutdown(std::net::Shutdown::Write);
         });
+    } else {
+        let _ = wsock.shutdown(std::net::Shutdown::Write);
     }
     if fresh {
         sh.sink.post(Event::Up { id, name, pc, version, hub });
     }
-    // Reader.
+    // Reader, until the connection closes or the other side says goodbye.
     loop {
         let Ok(f) = read_frame(&mut s) else { break };
-        if let Some(msg) = Msg::decode(&f) {
-            sh.sink.post(Event::Msg { from: id, msg });
+        match Msg::decode(&f) {
+            Some(Msg::Bye) => break,
+            Some(msg) => sh.sink.post(Event::Msg { from: id, msg }),
+            None => {}
         }
     }
+    let _ = s.shutdown(std::net::Shutdown::Both);
     let gone = {
         let mut reg = sh.reg.lock().unwrap();
+        reg.spare.remove(&serial);
         // Only if this connection was not replaced by a newer one.
         if reg.conns.get(&id).map_or(false, |c| c.serial == serial) {
             reg.conns.remove(&id);
@@ -497,18 +537,27 @@ mod tests {
         };
         wait_up(&ra, b.me());
         wait_up(&rb, a.me());
-        assert!(a.send(b.me(), &Msg::Join { sid: 7 }));
-        loop {
-            match rb.recv_timeout(Duration::from_secs(5)).unwrap() {
-                Event::Msg { from, msg: Msg::Join { sid: 7 } } => {
-                    assert_eq!(from, a.me());
-                    break;
+        // Everything sent straight after connecting arrives, in order, both ways.
+        for k in 0..200u64 {
+            assert!(a.send(b.me(), &Msg::Join { sid: k }));
+            assert!(b.send(a.me(), &Msg::Join { sid: 1000 + k }));
+        }
+        for (r, from, base) in [(&rb, a.me(), 0u64), (&ra, b.me(), 1000)] {
+            let mut next = 0u64;
+            while next < 200 {
+                match r.recv_timeout(Duration::from_secs(5)).expect("message lost") {
+                    Event::Msg { from: f, msg: Msg::Join { sid } } => {
+                        assert_eq!(f, from);
+                        assert_eq!(sid, base + next, "out of order");
+                        next += 1;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         // One connection each way survives, however the race went.
         std::thread::sleep(Duration::from_millis(300));
+
         assert!(a.connected(b.me()) && b.connected(a.me()));
         drop(b);
         loop {

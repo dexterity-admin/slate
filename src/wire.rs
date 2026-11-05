@@ -39,6 +39,8 @@ pub struct LibMeta {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
     Hello { id: u64, protocol: u32, name: String, pc: String, version: String, hub: bool },
+    /// Closing this connection on purpose (Slate exits or team features go off).
+    Bye,
     Presence { files: Vec<PresenceFile>, sessions: Vec<SessionInfo> },
     // Co-editing. `op` is an ot::Op in its encoded form.
     Join { sid: u64 },
@@ -150,6 +152,7 @@ impl Msg {
                 w.str(version);
                 w.u8(*hub as u8);
             }
+            Msg::Bye => w.u8(3),
             Msg::Presence { files, sessions } => {
                 w.u8(2);
                 w.u32(files.len() as u32);
@@ -295,6 +298,7 @@ impl Msg {
                 let sessions = (0..n).map(|_| Some(SessionInfo { sid: r.u64()?, gen: r.u64()?, host: r.u64()?, path: r.str()? })).collect::<Option<Vec<_>>>()?;
                 Msg::Presence { files, sessions }
             }
+            3 => Msg::Bye,
             10 => Msg::Join { sid: r.u64()? },
             11 => Msg::Snapshot { sid: r.u64()?, gen: r.u64()?, rev: r.u64()?, host: r.u64()?, members: r.ids()?, text: r.bytes()? },
             12 => Msg::Op { sid: r.u64()?, gen: r.u64()?, seq: r.u64()?, base: r.u64()?, op: r.bytes()? },
@@ -378,6 +382,7 @@ mod tests {
                 sessions: vec![SessionInfo { sid: 3, gen: 4, host: 1, path: r"\\srv\p\a.pcf".into() }],
             },
             Msg::Join { sid: 3 },
+            Msg::Bye,
             Msg::Snapshot { sid: 3, gen: 4, rev: 10, host: 1, members: vec![1, 2], text: b"PIPE\n".to_vec() },
             Msg::Op { sid: 3, gen: 4, seq: 2, base: 9, op: b"r5 i1:x".to_vec() },
             Msg::Seq { sid: 3, gen: 4, rev: 11, author: 2, seq: 2, op: b"r5 i1:x".to_vec() },
