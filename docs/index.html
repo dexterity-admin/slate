@@ -163,18 +163,19 @@
       <h2>Light and dark, quiet and quick</h2>
       <p>Every pixel is drawn with Direct2D: smooth scrolling, gliding tabs, file-type badges, seven accent colours, and an optional translucent window. Nothing animates unless it moves, so an idle Slate uses no CPU at all.</p>
       <ul>
+        <li>A toolbar of the everyday commands in Slate's own line icons, with a tooltip naming each button and its shortcut</li>
         <li>An AI assistant panel, ready for your company's own AI server (nothing is sent anywhere until one is set)</li>
       </ul>
     </div>
-    <div class="shot"><img src="img/dark-acrylic.png" alt="Slate in the dark theme with a translucent title bar and the assistant panel"></div>
+    <div class="shot"><img src="img/dark-acrylic.png" alt="Slate in the dark theme with the toolbar, a translucent title bar and the assistant panel"></div>
   </section>
 
   <h2 class="center">And everything you expect from an editor</h2>
-  <p class="center">Familiar Notepad++ shortcuts, and a command palette (Ctrl+Shift+P) that lists every command with its key.</p>
+  <p class="center">One-click toolbar buttons, familiar Notepad++ shortcuts, and a command palette (Ctrl+Shift+P) that lists every command with its key.</p>
   <div class="grid3">
     <div class="card"><h3>Editing</h3><p>Multiple carets, column selection, macros, sort and de-duplicate lines, case changes, comment toggling, bookmarks, folding.</p></div>
     <div class="card"><h3>Search</h3><p>Find and replace with regular expressions, find in files, go to line, same-word highlighting.</p></div>
-    <div class="card"><h3>Files</h3><p>Sessions that restore unsaved text after a crash, UTF-8 / UTF-16 / ANSI, CRLF / LF kept on save, split view, 21 syntax colourings.</p></div>
+    <div class="card"><h3>Files</h3><p>Unsaved text in every tab survives closing, crashes, power cuts and Windows restarts; UTF-8 / UTF-16 / ANSI, CRLF / LF kept on save, split view, 21 syntax colourings.</p></div>
   </div>
 
   <h2 class="center">Measured against Notepad++</h2>
@@ -187,6 +188,7 @@
 
   <h2 class="center" id="faq">Questions</h2>
   <details><summary>Do I need admin rights?</summary><p>No. The installer puts Slate in your user folder. A portable zip is available too.</p></details>
+  <details><summary>What happens to unsaved work if the PC restarts?</summary><p>It comes back. Like Notepad++, Slate keeps every open tab and its unsaved text, new tabs that were never saved included, whether you close Slate, Windows shuts down or restarts, or the power goes. Unsaved text is copied within two seconds of typing, and each copy is written in full before it replaces the last, so a power cut cannot damage it. Files of 64&nbsp;MB and more are copied when Windows shuts down, not while you type.</p></details>
   <details><summary>How does it update?</summary><p>Slate checks for a new release now and then, shows an "Update" button, and installs it in place. Each release is signed; if a new version fails to start, Slate puts the previous one back.</p></details>
   <details><summary>What do the team features need?</summary><p>Nothing to set up: Slates on the same network find each other. The first time, Windows may ask whether Slate may use the network; allowing it on private networks lets others connect to you (if it is not allowed, you can still connect to them). Instant search needs one always-on PC to run <code>slate.exe --hub &lt;folders&gt;</code>.</p></details>
   <details><summary>Does anything leave the office?</summary><p>No. Team features talk only to other Slates on your network, and the AI assistant only to the AI server your company sets. The only outside connection is the update check to GitHub, which can be turned off.</p></details>
