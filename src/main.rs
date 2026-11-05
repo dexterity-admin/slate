@@ -577,6 +577,7 @@ fn main() {
         }
         if let Some(a) = app_from(hwnd) {
             a.finish_handover();
+            a.test_update();
             a.schedule_update_checks();
             // The splash, except for benchmarks and an update taking over.
             if !bench && a.upd.handover.is_none() {

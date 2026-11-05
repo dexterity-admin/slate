@@ -127,6 +127,17 @@ impl App {
         });
     }
 
+    /// Test hook (tools\rollback-test.ps1): installs a local file as if it
+    /// were a downloaded update, through the real swap, start and
+    /// handshake. Only runs when SLATE_TEST_UPDATE names the file.
+    pub fn test_update(&mut self) {
+        let Some(p) = std::env::var_os("SLATE_TEST_UPDATE") else { return };
+        // The new process must not install it again.
+        std::env::remove_var("SLATE_TEST_UPDATE");
+        let m = Manifest { version: "9.9.9".into(), size: 0, sha256: String::new(), notes: String::new() };
+        self.apply_update(m, PathBuf::from(p));
+    }
+
     fn apply_update(&mut self, m: Manifest, path: PathBuf) {
         // Everything open, including unsaved text, goes into the session first.
         self.save_session_forced();
