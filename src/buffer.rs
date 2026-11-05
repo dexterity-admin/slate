@@ -142,6 +142,8 @@ pub struct Buffer {
     /// Background load in progress: (bytes read so far, total bytes).
     /// The buffer is an empty placeholder and must not be edited or saved.
     pub loading: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
+    /// Background save in progress: (bytes written, total). Read-only meanwhile.
+    pub saving: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
     /// Shown as a table instead of text.
     pub grid: Option<Box<crate::csv::Grid>>,
     /// One side of a revision compare; such a buffer is read-only.
@@ -191,6 +193,7 @@ impl Buffer {
             tab_size: 4,
             label: None,
             loading: None,
+            saving: None,
             grid: None,
             diff: None,
             lock_since: None,
@@ -202,7 +205,7 @@ impl Buffer {
 
     /// Compare sides and files someone else locked cannot be edited.
     pub fn read_only(&self) -> bool {
-        self.diff.is_some() || self.locked_by.is_some() || self.collab.as_ref().map_or(false, |c| c.joining())
+        self.diff.is_some() || self.locked_by.is_some() || self.loading.is_some() || self.saving.is_some() || self.collab.as_ref().map_or(false, |c| c.joining())
     }
 
     pub fn name(&self) -> String {

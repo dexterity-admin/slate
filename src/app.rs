@@ -30,14 +30,37 @@ pub const T_STATUS: usize = 4;
 pub const T_LOAD: usize = 8;
 pub const T_ANIM: usize = 9;
 pub const WM_LOADED: u32 = WM_APP + 5;
+/// A background save finished: `Box<Saved>` in lParam.
+pub const WM_SAVED: u32 = WM_APP + 8;
+
+pub struct Saved {
+    pub id: u32,
+    pub path: PathBuf,
+    pub result: Result<(), String>,
+}
 /// Files at least this large load on a worker thread.
 const ASYNC_LOAD: u64 = 16 << 20;
 
 /// Result of a background load, posted back to the window.
 pub struct Loaded {
     pub id: u32,
-    pub result: Result<(crate::doc::Doc, Enc, Eol, bool), String>,
+    pub msg: LoadMsg,
 }
+
+/// What a background load reports, in order.
+pub enum LoadMsg {
+    /// More decoded text, and its line starts relative to the piece.
+    Piece { text: Vec<u8>, starts: Vec<u32> },
+    /// The file is not UTF-8 after all: the text so far is dropped and
+    /// comes again as ANSI.
+    Restart,
+    Done { enc: Enc, eol: Eol, mixed: bool },
+    Fail(String),
+}
+
+/// Files at least this big are "huge": no syntax colouring, no crash-safety
+/// backups and no automatic match count, so they stay quick to work in.
+pub const HUGE: usize = 64 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cmd {
@@ -471,6 +494,8 @@ pub struct App {
     /// Active-tab underline per view: (x tween, width tween, target x, target w).
     pub tab_ind: RefCell<[Option<(Tween, Tween, f32, f32)>; 2]>,
     pub pal_since: Option<Instant>,
+    /// The splash (logo) shown when a window opens or comes forward with files.
+    pub splash_since: Option<Instant>,
     pub find_since: Option<Instant>,
     pub anim_timer: bool,
     /// The new version took over; close without saving the session again.
@@ -483,6 +508,8 @@ pub struct App {
     pub team: Option<crate::team::Team>,
     /// Co-editing sessions already offered, with who was offered.
     pub collab_offered: HashMap<u64, u64>,
+    /// The window closes once background saves are done.
+    pub close_after_save: bool,
     /// The team library held on this PC.
     pub library: crate::library::Store,
     /// The instant search waiting for the hub's answer.
@@ -550,6 +577,8 @@ impl App {
             cmp_sync: None,
             team: None,
             collab_offered: HashMap::new(),
+            close_after_save: false,
+            splash_since: None,
             library: crate::library::Store::load(),
             search_qid: None,
         }
@@ -708,19 +737,10 @@ impl App {
             self.bufs.retain(|b| b.id != old);
         }
         settings::push_recent(&pb.to_string_lossy());
+        // Room for the whole text up front, so pieces never reallocate it.
+        self.bufs.last_mut().unwrap().doc = crate::doc::Doc::with_capacity(size as usize);
         let hwnd = self.hwnd.0 as isize;
-        std::thread::spawn(move || {
-            let result = crate::doc::read_for_doc_progress(&pb, Some(&progress)).map_err(|e| e.to_string()).map(|raw| {
-                let d = enc::decode(raw, None);
-                (crate::doc::Doc::load(d.text), d.enc, d.eol, d.mixed_eol)
-            });
-            let p = Box::into_raw(Box::new(Loaded { id, result }));
-            unsafe {
-                if PostMessageW(HWND(hwnd as *mut _), WM_LOADED, WPARAM(0), LPARAM(p as isize)).is_err() {
-                    drop(Box::from_raw(p));
-                }
-            }
-        });
+        std::thread::spawn(move || stream_file(&pb, id, &progress, hwnd));
         unsafe {
             SetTimer(self.hwnd, T_LOAD, 120, None);
         }
@@ -730,43 +750,74 @@ impl App {
 
     pub fn on_loaded(&mut self, l: Loaded) {
         // The tab may have been closed while loading.
-        if let Some(i) = self.bufs.iter().position(|b| b.id == l.id && b.loading.is_some()) {
-            match l.result {
-                Ok((doc, enc, eol, mixed)) => {
-                    let b = &mut self.bufs[i];
-                    b.doc = doc;
-                    b.enc = enc;
-                    b.eol = eol;
-                    b.mixed_eol = mixed;
-                    b.loading = None;
-                    b.states.clear();
-                    b.gen += 1;
+        let Some(i) = self.bufs.iter().position(|b| b.id == l.id && b.loading.is_some()) else {
+            return self.load_timer();
+        };
+        match l.msg {
+            LoadMsg::Piece { text, starts } => {
+                let b = &mut self.bufs[i];
+                let first = b.doc.len() == 0;
+                b.doc.append_loaded(&text, &starts);
+                b.gen += 1;
+                if first {
                     b.sels = vec![Sel::default()];
-                    b.mtime = b.path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-                    let name = b.name();
-                    if mixed {
-                        self.flash(&format!("{name}: mixed line endings unified to {} (applies on save)", eol.name()));
-                    }
-                    self.auto_grid(l.id);
-                    self.team_apply_locks();
-                    self.team_on_open(l.id);
                 }
-                Err(e) => {
-                    let name = self.bufs[i].name();
-                    self.bufs[i].loading = None;
-                    if let Some((v, t)) = self.find_open_id(l.id) {
-                        self.close_tab(v, t);
-                    }
-                    self.flash(&format!("Cannot open {name}: {e}"));
+                self.redraw();
+                return;
+            }
+            LoadMsg::Restart => {
+                let b = &mut self.bufs[i];
+                let cap = b.loading.as_ref().map(|l| l.1 as usize).unwrap_or(0);
+                b.doc = crate::doc::Doc::with_capacity(cap);
+                b.gen += 1;
+                b.states.clear();
+                b.sels = vec![Sel::default()];
+                return;
+            }
+            LoadMsg::Done { enc, eol, mixed } => {
+                let b = &mut self.bufs[i];
+                b.enc = enc;
+                b.eol = eol;
+                b.mixed_eol = mixed;
+                b.loading = None;
+                b.states.clear();
+                b.gen += 1;
+                b.normalize();
+                b.mtime = b.path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+                let name = b.name();
+                let huge = b.doc.len() >= HUGE;
+                if huge && b.lang != 0 {
+                    // Colouring would lex the whole file to reach its end.
+                    b.lang = 0;
                 }
+                if mixed {
+                    self.flash(&format!("{name}: mixed line endings unified to {} (applies on save)", eol.name()));
+                } else if huge {
+                    self.flash(&format!("{name} is open. Very large file: syntax colouring and automatic match counts are off"));
+                }
+                self.auto_grid(l.id);
+                self.team_apply_locks();
+                self.team_on_open(l.id);
+            }
+            LoadMsg::Fail(e) => {
+                let name = self.bufs[i].name();
+                self.bufs[i].loading = None;
+                if let Some((v, t)) = self.find_open_id(l.id) {
+                    self.close_tab(v, t);
+                }
+                self.flash(&format!("Cannot open {name}: {e}"));
             }
         }
+        self.load_timer();
+        self.after_switch();
+    }
+
+    fn load_timer(&mut self) {
         if !self.bufs.iter().any(|b| b.loading.is_some()) {
             unsafe {
                 let _ = KillTimer(self.hwnd, T_LOAD);
             }
         }
-        self.after_switch();
     }
 
     pub fn open_dialog(&mut self) {
@@ -778,6 +829,10 @@ impl App {
 
     pub fn save_buf(&mut self, id: u32, save_as: bool) -> bool {
         let i = self.bi(id);
+        if self.bufs[i].saving.is_some() {
+            self.flash("Still saving this file\u{2026}");
+            return false;
+        }
         let path = match (&self.bufs[i].path, save_as) {
             (Some(p), false) => p.clone(),
             (p, _) => {
@@ -790,13 +845,101 @@ impl App {
                 }
             }
         };
-        let b = &mut self.bufs[i];
-        let bytes = enc::encode(&b.text_all(), b.enc, b.eol);
-        if let Err(e) = std::fs::write(&path, bytes) {
+        if self.bufs[i].doc.len() >= HUGE {
+            self.save_in_background(i, path);
+            return true;
+        }
+        let b = &self.bufs[i];
+        let (enc, eol) = (b.enc, b.eol);
+        let parts = b.doc.gap.parts();
+        let r = std::fs::File::create(&path).and_then(|f| {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+            enc::write_encoded(&mut w, parts, enc, eol, &mut |_| {})
+        });
+        if let Err(e) = r {
             let msg = format!("Could not save {}:\n{e}", path.display());
             sys::info(self.hwnd, &msg);
             return false;
         }
+        self.finish_save(i, path);
+        true
+    }
+
+    /// Saving a huge file on a worker thread. The text stays put meanwhile:
+    /// the buffer is read-only and its tab cannot close until it is done.
+    fn save_in_background(&mut self, i: usize, path: PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let b = &mut self.bufs[i];
+        let progress = Arc::new(AtomicU64::new(0));
+        b.saving = Some((progress.clone(), b.doc.len() as u64));
+        let (enc, eol, id) = (b.enc, b.eol, b.id);
+        let [p0, p1] = b.doc.gap.parts();
+        // The worker reads the text in place. Nothing can change or free it
+        // until WM_SAVED arrives: edits, reloads and closing check `saving`.
+        struct Text(*const u8, usize, *const u8, usize);
+        unsafe impl Send for Text {}
+        let text = Text(p0.as_ptr(), p0.len(), p1.as_ptr(), p1.len());
+        let hwnd = self.hwnd.0 as isize;
+        self.flash(&format!("Saving {}\u{2026}", path.display()));
+        std::thread::spawn(move || {
+            let text = text;
+            let parts = unsafe { [std::slice::from_raw_parts(text.0, text.1), std::slice::from_raw_parts(text.2, text.3)] };
+            // A temporary file first, so a failed save never leaves half a file.
+            let tmp = path.with_file_name(format!("{}.slate-saving", path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
+            let r = std::fs::File::create(&tmp)
+                .and_then(|f| {
+                    let mut w = std::io::BufWriter::with_capacity(4 << 20, f);
+                    enc::write_encoded(&mut w, parts, enc, eol, &mut |n| progress.store(n as u64, Ordering::Relaxed))?;
+                    w.into_inner().map_err(|e| e.into_error())?.sync_all()
+                })
+                .and_then(|_| std::fs::rename(&tmp, &path))
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp);
+                    e.to_string()
+                });
+            let p = Box::into_raw(Box::new(Saved { id, path, result: r }));
+            unsafe {
+                if PostMessageW(HWND(hwnd as *mut _), WM_SAVED, WPARAM(0), LPARAM(p as isize)).is_err() {
+                    drop(Box::from_raw(p));
+                }
+            }
+        });
+        unsafe {
+            SetTimer(self.hwnd, T_LOAD, 120, None);
+        }
+        self.redraw();
+    }
+
+    pub fn on_saved(&mut self, s: Saved) {
+        if let Some(i) = self.bufs.iter().position(|b| b.id == s.id) {
+            self.bufs[i].saving = None;
+            match s.result {
+                Ok(()) => self.finish_save(i, s.path),
+                Err(e) => {
+                    let msg = format!("Could not save {}:\n{e}", s.path.display());
+                    sys::info(self.hwnd, &msg);
+                }
+            }
+        }
+        if !self.bufs.iter().any(|b| b.saving.is_some() || b.loading.is_some()) {
+            unsafe {
+                let _ = KillTimer(self.hwnd, T_LOAD);
+            }
+        }
+        // Closing was asked for while saving.
+        if self.close_after_save && !self.bufs.iter().any(|b| b.saving.is_some()) {
+            unsafe {
+                let _ = PostMessageW(self.hwnd, windows::Win32::UI::WindowsAndMessaging::WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+        self.redraw();
+    }
+
+    /// What every successful save does to the buffer.
+    fn finish_save(&mut self, i: usize, path: PathBuf) {
+        let id = self.bufs[i].id;
+        let b = &mut self.bufs[i];
         let new_name = b.path.as_ref() != Some(&path);
         b.path = Some(path.clone());
         b.mark_saved();
@@ -804,7 +947,7 @@ impl App {
         b.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if new_name {
             let lang = syntax::lang_for_path(&path.to_string_lossy());
-            if lang != 0 || b.lang == 0 {
+            if (lang != 0 || b.lang == 0) && b.doc.len() < HUGE {
                 b.set_lang(lang);
             }
         }
@@ -815,12 +958,15 @@ impl App {
         self.flash(&format!("Saved {}", path.display()));
         self.collab_saved(id);
         self.update_title();
-        true
     }
 
     /// Closes tab `idx` of view `v`; false when the user cancelled.
     pub fn close_tab(&mut self, v: usize, idx: usize) -> bool {
         let id = self.views[v].tabs[idx].buf;
+        if self.bufs[self.bi(id)].saving.is_some() {
+            self.flash("Still saving this file \u{2013} it can close once the save is done");
+            return false;
+        }
         let elsewhere = self.views[1 - v].tabs.iter().any(|t| t.buf == id);
         let i = self.bi(id);
         if !elsewhere && self.bufs[i].dirty() && Some(id) != self.results_buf {
@@ -989,6 +1135,11 @@ impl App {
                 continue;
             }
             if b.backed_up_gen == b.gen && b.backup.is_some() {
+                continue;
+            }
+            // Writing a huge file every few seconds would stall everything;
+            // closing Slate asks to save it instead.
+            if b.doc.len() >= HUGE {
                 continue;
             }
             if !made_dir {
@@ -1219,6 +1370,9 @@ impl App {
         if self.bufs[i].collab.is_some() {
             return self.flash("Leave co-editing (Ctrl+Shift+E) before reloading from disk");
         }
+        if self.bufs[i].saving.is_some() || self.bufs[i].loading.is_some() {
+            return;
+        }
         let Some(p) = self.bufs[i].path.clone() else { return };
         let Ok(raw) = crate::doc::read_for_doc(&p) else { return };
         let d = enc::decode(raw, force);
@@ -1313,6 +1467,8 @@ impl App {
         let q = fb.query();
         self.last_find = q.clone();
         let (count, err) = match q.compile() {
+            // A huge file is not counted on every keystroke.
+            Ok(_) if self.cur_ref().doc.len() >= search::WINDOWED => (None, None),
             Ok(m) => {
                 let text = String::from_utf8_lossy(self.cur().doc.gap.contiguous());
                 (Some(m.find_all(&text, 100_000).len()), None)
@@ -1338,15 +1494,22 @@ impl App {
         self.last_find = q;
         let b = self.cur();
         let p = b.primary();
-        // Borrowed, not copied: valid UTF-8 needs no allocation.
-        let hit = {
-            let text = String::from_utf8_lossy(b.doc.gap.contiguous());
-            if forward {
-                m.find_from(&text, p.hi()).or_else(|| m.find_from(&text, 0))
-            } else {
-                m.find_before(&text, p.lo()).or_else(|| m.find_before(&text, text.len() + 1))
-            }
-        };
+        // A regular expression goes through a huge file a stretch at a time,
+        // so one press never freezes Slate for long.
+        const STRETCH: usize = 64 << 20;
+        let slow = b.doc.len() >= search::WINDOWED && !m.is_literal();
+        let from = if forward { p.hi() } else { p.lo() };
+        let hit = search::doc_find(&mut b.doc, &m, from, forward, slow.then_some(STRETCH));
+        if hit.is_none() && slow {
+            let n = b.doc.len();
+            let to = if forward { (from + STRETCH).min(n) } else { from.saturating_sub(STRETCH) };
+            let to = if to == n && forward { 0 } else if to == 0 && !forward { n } else { to };
+            b.set_caret(to);
+            let line = b.doc.line_of(to) + 1;
+            self.reveal_caret();
+            self.flash(&format!("No match in the next 64 MB (searched up to line {line}) \u{2013} F3 searches on. Plain text searches a huge file far faster than a regular expression"));
+            return self.redraw();
+        }
         match hit {
             Some((a, z)) => {
                 b.sels = vec![Sel { anchor: a, head: z }];
@@ -1366,11 +1529,15 @@ impl App {
         let Ok(m) = q.compile() else { return };
         let b = self.cur();
         let p = b.primary();
-        let r = {
-            let text = String::from_utf8_lossy(b.doc.gap.contiguous());
-            (!p.is_empty() && m.find_from(&text, p.lo()) == Some((p.lo(), p.hi())))
-                .then(|| m.expand(&q, &text, (p.lo(), p.hi()), &repl))
-        };
+        // Only the selection and what follows it is looked at, so this
+        // stays quick in a huge file.
+        let r = (!p.is_empty())
+            .then(|| {
+                let end = (p.hi() + 4096).min(b.doc.len());
+                let text = String::from_utf8_lossy(&b.doc.text(p.lo(), end)).into_owned();
+                (m.find_from(&text, 0) == Some((0, p.hi() - p.lo()))).then(|| m.expand(&q, &text, (0, p.hi() - p.lo()), &repl))
+            })
+            .flatten();
         if let Some(r) = r {
             b.apply(vec![(p.lo(), p.hi(), r.into_bytes())], EditKind::Other);
             self.edited();
@@ -1666,6 +1833,7 @@ impl App {
                 | Cmd::FocusOther | Cmd::CloseSplit | Cmd::NextTab | Cmd::PrevTab | Cmd::ToggleSession | Cmd::About
                 | Cmd::CheckUpdates | Cmd::InstallUpdate | Cmd::AutoUpdate | Cmd::SaveAll | Cmd::FindInFiles
                 | Cmd::MacroRecord | Cmd::UseTabs | Cmd::TabSize | Cmd::Accent | Cmd::Animations
+                | Cmd::GotoLine | Cmd::Copy | Cmd::SelectAll | Cmd::TeamPeople | Cmd::TeamSearch
         );
         if !self.bufs.is_empty() && self.cur_ref().loading.is_some() && !safe_while_loading {
             self.flash("Still loading this file…");
@@ -2446,5 +2614,79 @@ mod tests {
         assert!(fuzzy("close tab", "file: close other tabs").is_some());
         assert_eq!(title_case("hello wORLD-x"), "Hello World-X");
         assert_eq!(strip_unc(PathBuf::from(r"\\?\D:\a")), PathBuf::from(r"D:\a"));
+    }
+}
+
+/// Reads, decodes and indexes a file in pieces on a worker thread, posting
+/// each piece as soon as it is ready: the start of a big file shows at
+/// once and the rest follows as fast as the disk delivers it.
+fn stream_file(path: &Path, id: u32, progress: &std::sync::atomic::AtomicU64, hwnd: isize) {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    let post = |msg: LoadMsg| {
+        let p = Box::into_raw(Box::new(Loaded { id, msg }));
+        unsafe {
+            if PostMessageW(HWND(hwnd as *mut _), WM_LOADED, WPARAM(0), LPARAM(p as isize)).is_err() {
+                drop(Box::from_raw(p));
+                return false;
+            }
+        }
+        true
+    };
+    const PIECE: usize = 8 << 20;
+    let mut force = None;
+    'again: loop {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                post(LoadMsg::Fail(e.to_string()));
+                return;
+            }
+        };
+        let total = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut dec = enc::StreamDecoder::new(force);
+        let mut buf = vec![0u8; PIECE];
+        let mut read = 0u64;
+        loop {
+            // Fill the piece fully (a read can return less).
+            let mut n = 0;
+            while n < PIECE {
+                match f.read(&mut buf[n..]) {
+                    Ok(0) => break,
+                    Ok(k) => n += k,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        post(LoadMsg::Fail(e.to_string()));
+                        return;
+                    }
+                }
+            }
+            read += n as u64;
+            let last = n < PIECE || read >= total;
+            match dec.push(&buf[..n], last) {
+                Ok(text) => {
+                    let mut starts = Vec::new();
+                    crate::doc::each_byte(&text, b'\n', |i| starts.push((i + 1) as u32));
+                    if !text.is_empty() && !post(LoadMsg::Piece { text, starts }) {
+                        return;
+                    }
+                }
+                Err(enc::NotUtf8) => {
+                    force = Some(Enc::Ansi);
+                    progress.store(0, Ordering::Relaxed);
+                    if !post(LoadMsg::Restart) {
+                        return;
+                    }
+                    continue 'again;
+                }
+            }
+            progress.store(read, Ordering::Relaxed);
+            if last {
+                break;
+            }
+        }
+        let (enc, eol, mixed) = dec.finish();
+        post(LoadMsg::Done { enc, eol, mixed });
+        return;
     }
 }

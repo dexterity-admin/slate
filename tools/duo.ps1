@@ -29,6 +29,7 @@ public class DW {
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
   [DllImport("user32.dll")] public static extern bool UpdateWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -60,7 +61,15 @@ foreach ($s in $Steps.Split('|')) {
         $bw = $rb.R - $ra.L; $bh = [Math]::Max($ra.B, $rb.B) - $ra.T
         $bmp = New-Object System.Drawing.Bitmap($bw, $bh)
         $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.CopyFromScreen($ra.L, $ra.T, 0, 0, (New-Object System.Drawing.Size($bw, $bh)))
+        # Each window's own pixels, whatever is on top of them.
+        foreach ($pair in @(@($pa, $ra), @($pb, $rb))) {
+            $p = $pair[0]; $r = $pair[1]
+            if ($p.HasExited) { continue }
+            $one = New-Object System.Drawing.Bitmap(($r.R - $r.L), ($r.B - $r.T))
+            $g1 = [System.Drawing.Graphics]::FromImage($one)
+            $hdc = $g1.GetHdc(); [void][DW]::PrintWindow($p.MainWindowHandle, $hdc, 2); $g1.ReleaseHdc($hdc)
+            $g.DrawImage($one, $r.L - $ra.L, $r.T - $ra.T); $g1.Dispose(); $one.Dispose()
+        }
         $out = Join-Path $OutDir "$rest.png"
         $bmp.Save($out); $g.Dispose(); $bmp.Dispose()
         Write-Output "saved $out"

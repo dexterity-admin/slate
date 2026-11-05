@@ -30,6 +30,7 @@ public class SW {
   [DllImport("user32.dll")] public static extern bool UpdateWindow(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string c, string t);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -59,6 +60,7 @@ foreach ($s in $Steps.Split('|')) {
         'move' { $x, $y = $arg.Split(','); [void][SW]::SendMessageW($hw, 0x0200, [IntPtr]0, (MkLp $x $y)) }
         'close' { [void][SW]::SendMessageW($hw, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero); Start-Sleep -Milliseconds 500 }
         'w' { Start-Sleep -Milliseconds ([int]$arg) }
+        'max' { [void][SW]::SendMessageW($hw, 0x0112, [IntPtr]0xF030, [IntPtr]::Zero); Start-Sleep -Milliseconds 400 }
         'shot' {
             Start-Sleep -Milliseconds 350
             [void][SW]::UpdateWindow($hw)
@@ -67,7 +69,8 @@ foreach ($s in $Steps.Split('|')) {
             $bw = $r.R - $r.L; $bh = $r.B - $r.T
             $bmp = New-Object System.Drawing.Bitmap($bw, $bh)
             $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.CopyFromScreen($r.L, $r.T, 0, 0, (New-Object System.Drawing.Size($bw, $bh)))
+            # The window's own pixels, whatever is on top of it.
+            $hdc = $g.GetHdc(); [void][SW]::PrintWindow($hw, $hdc, 2); $g.ReleaseHdc($hdc)
             $out = Join-Path $OutDir "$arg.png"
             $bmp.Save($out); $g.Dispose(); $bmp.Dispose()
             Write-Output "saved $out"

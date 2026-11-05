@@ -113,6 +113,8 @@ pub struct Gfx {
     geos: RefCell<HashMap<Icon, ID2D1PathGeometry>>,
     /// Brushes for one-off colours (file badges), keyed by rgb and alpha.
     tints: RefCell<HashMap<(u32, u8), ID2D1SolidColorBrush>>,
+    /// The app icon as bitmaps, keyed by pixel size.
+    logos: RefCell<HashMap<u32, windows::Win32::Graphics::Direct2D::ID2D1Bitmap>>,
 }
 
 impl Gfx {
@@ -138,6 +140,7 @@ impl Gfx {
                 stroke: None,
                 geos: RefCell::new(HashMap::new()),
                 tints: RefCell::new(HashMap::new()),
+                logos: RefCell::new(HashMap::new()),
             })
         }
     }
@@ -163,6 +166,7 @@ impl Gfx {
     pub fn drop_target(&mut self) {
         self.brushes.clear();
         self.tints.borrow_mut().clear();
+        self.logos.borrow_mut().clear();
         self.rt = None;
         self.hrt = None;
     }
@@ -209,6 +213,67 @@ impl Gfx {
 
     pub fn color(&self, c: C) -> D2D1_COLOR_F {
         hex(self.palette()[c as usize])
+    }
+
+    /// The app icon (resource 1) at `px` pixels, exactly as Windows shows
+    /// it: the icon file has images drawn for small sizes, and Windows picks
+    /// the right one. `scale` is the display scale, so one bitmap pixel is
+    /// one screen pixel.
+    pub fn logo(&self, px: u32, scale: f32) -> Option<windows::Win32::Graphics::Direct2D::ID2D1Bitmap> {
+        use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT};
+        use windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, LoadImageW, HICON, ICONINFO, IMAGE_ICON, LR_DEFAULTCOLOR};
+        if let Some(b) = self.logos.borrow().get(&px) {
+            return Some(b.clone());
+        }
+        let n = px.clamp(8, 512);
+        let mut data = vec![0u8; (n * n * 4) as usize];
+        unsafe {
+            let hinst = GetModuleHandleW(None).ok()?;
+            let h = LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, n as i32, n as i32, LR_DEFAULTCOLOR).ok()?;
+            let icon = HICON(h.0);
+            let mut ii = ICONINFO::default();
+            let ok = GetIconInfo(icon, &mut ii).is_ok();
+            if ok {
+                let dc = CreateCompatibleDC(None);
+                let mut bi = BITMAPINFO::default();
+                bi.bmiHeader = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: n as i32,
+                    biHeight: -(n as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                };
+                GetDIBits(dc, ii.hbmColor, 0, n, Some(data.as_mut_ptr() as *mut _), &mut bi, DIB_RGB_COLORS);
+                let _ = DeleteDC(dc);
+                let _ = DeleteObject(ii.hbmColor);
+                let _ = DeleteObject(ii.hbmMask);
+            }
+            let _ = DestroyIcon(icon);
+            if !ok {
+                return None;
+            }
+            // Icons store straight alpha; Direct2D wants it premultiplied.
+            for p in data.chunks_exact_mut(4) {
+                let a = p[3] as u32;
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                }
+            }
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0 * scale,
+                dpiY: 96.0 * scale,
+            };
+            let bmp = self.rt().CreateBitmap(D2D_SIZE_U { width: n, height: n }, Some(data.as_ptr() as *const _), n * 4, &props).ok()?;
+            self.logos.borrow_mut().insert(px, bmp.clone());
+            Some(bmp)
+        }
     }
 
     /// A brush for an arbitrary colour (cached).
@@ -279,7 +344,7 @@ impl Gfx {
         }
     }
 
-    fn format(&self, family: &str, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
+    pub fn format(&self, family: &str, size: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
         let f = wide(family);
         unsafe {
             self.dw.CreateTextFormat(

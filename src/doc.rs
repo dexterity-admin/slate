@@ -179,6 +179,11 @@ impl Gap {
         self.buf[self.to_phys(l)]
     }
 
+    /// The text as the two pieces around the gap, without moving it.
+    pub fn parts(&self) -> [&[u8]; 2] {
+        [&self.buf[..self.gs], &self.buf[self.ge..]]
+    }
+
     /// Moves the gap to the end so the whole text is one slice.
     pub fn contiguous(&mut self) -> &[u8] {
         let n = self.text_len();
@@ -193,6 +198,20 @@ pub struct Doc {
 }
 
 impl Doc {
+    /// An empty document with room for `n` bytes of text.
+    pub fn with_capacity(n: usize) -> Self {
+        let size = n + initial_gap(n);
+        Self { gap: Gap { buf: vec![0u8; size], gs: 0, ge: size }, starts: vec![0] }
+    }
+
+    /// Appends a piece of a file being loaded; `starts` are the line starts
+    /// inside the piece (positions just after each newline).
+    pub fn append_loaded(&mut self, text: &[u8], starts: &[u32]) {
+        let base = self.len();
+        self.gap.insert(base, text);
+        self.starts.extend(starts.iter().map(|&s| s + base as u32));
+    }
+
     pub fn load(data: Vec<u8>) -> Self {
         let gap = Gap::from_bytes(data);
         let starts = Self::scan(&gap);
@@ -327,6 +346,33 @@ impl Doc {
 
 #[cfg(test)]
 mod tests {
+    /// Timings for each step of opening a big file: set SLATE_HUGE_FILE
+    /// and run with --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn huge_file_load_timings() {
+        let Ok(p) = std::env::var("SLATE_HUGE_FILE") else { return };
+        let t = std::time::Instant::now();
+        let raw = read_for_doc(std::path::Path::new(&p)).unwrap();
+        eprintln!("read      {:?} ({} MB)", t.elapsed(), raw.len() >> 20);
+        let t = std::time::Instant::now();
+        let enc = crate::enc::detect(&raw);
+        eprintln!("detect    {:?} {:?}", t.elapsed(), enc.name());
+        let t = std::time::Instant::now();
+        let d = crate::enc::decode(raw, None);
+        eprintln!("decode    {:?} (eol {})", t.elapsed(), d.eol.name());
+        let t = std::time::Instant::now();
+        let doc = Doc::load(d.text);
+        eprintln!("index     {:?} ({} lines)", t.elapsed(), doc.line_count());
+        let t = std::time::Instant::now();
+        let mut doc = doc;
+        let all = doc.gap.contiguous().to_vec();
+        eprintln!("copy all  {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let out = crate::enc::encode(&all, crate::enc::Enc::Utf8, crate::enc::Eol::Crlf);
+        eprintln!("encode    {:?} ({} MB)", t.elapsed(), out.len() >> 20);
+    }
+
     use super::*;
     use std::time::Instant;
 

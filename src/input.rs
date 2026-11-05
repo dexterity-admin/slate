@@ -137,7 +137,9 @@ impl App {
     }
 
     fn editor_key(&mut self, vk: u32, ctrl: bool, shift: bool, alt: bool) -> bool {
-        if self.cur_ref().loading.is_some() {
+        // While a big file streams in you can move around in what has
+        // arrived; edits wait (the buffer is read-only until then).
+        if self.cur_ref().loading.is_some() && self.cur_ref().doc.len() == 0 {
             return false;
         }
         let vis = self.vis_rows(self.av);
@@ -310,10 +312,10 @@ impl App {
         let Ok(m) = q.compile() else { return };
         let b = self.cur();
         let from = b.primary().lo();
-        let hit = {
-            let text = String::from_utf8_lossy(b.doc.gap.contiguous());
-            m.find_from(&text, from).or_else(|| m.find_from(&text, 0))
-        };
+        // Searching as you type looks a few MB ahead in a huge file; Enter
+        // (find next) searches all of it.
+        let limit = (b.doc.len() >= crate::search::WINDOWED).then_some(32 << 20);
+        let hit = crate::search::doc_find(&mut b.doc, &m, from, true, limit);
         if let Some((a, z)) = hit {
             b.sels = vec![Sel { anchor: a, head: z }];
             self.reveal_caret();

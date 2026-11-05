@@ -11,7 +11,7 @@ use crate::ui::*;
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::Graphics::Direct2D::Common::D2D_POINT_2F;
 use windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE;
-use windows::Win32::Graphics::DirectWrite::{DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_ALIGNMENT_TRAILING};
+use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING};
 
 const D2DERR_RECREATE_TARGET: i32 = 0x8899000Cu32 as i32;
 
@@ -20,6 +20,7 @@ impl App {
         if self.gfx.rt.is_none() || self.views[0].tabs.is_empty() {
             return;
         }
+        crate::trace("paint");
         self.cache_tick += 1;
         self.caret_target.set(None);
         unsafe {
@@ -41,6 +42,7 @@ impl App {
         self.paint_status();
         self.paint_find();
         self.paint_palette();
+        self.paint_splash();
         let r = unsafe { self.gfx.rt().EndDraw(None, None) };
         if let Err(e) = r {
             if e.code().0 == D2DERR_RECREATE_TARGET {
@@ -58,7 +60,8 @@ impl App {
         let moving = self.scroll_anim.iter().flatten().any(|t| !t.done())
             || self.tab_ind.borrow().iter().flatten().any(|(x, w, ..)| !x.done() || !w.done())
             || crate::anim::appear(self.pal_since, PANEL_MS) < 1.0 && self.palette.is_some()
-            || crate::anim::appear(self.find_since, PANEL_MS) < 1.0 && self.find.is_some();
+            || crate::anim::appear(self.find_since, PANEL_MS) < 1.0 && self.find.is_some()
+            || self.splash_since.is_some();
         if !moving {
             self.scroll_anim = [None, None];
         }
@@ -79,8 +82,72 @@ impl App {
         1.0
     }
 
-    /// The app mark: the pipe "S" on a slate tile, as in the app icon.
+    /// The splash: the logo and name over the window for a moment, fading
+    /// out. It is only drawn, so the editor works underneath straight away.
+    fn paint_splash(&mut self) {
+        const HOLD: f32 = 450.0;
+        const FADE: f32 = 400.0;
+        let Some(t0) = self.splash_since else { return };
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        if ms >= HOLD + FADE || !settings::get().animate {
+            self.splash_since = None;
+            return;
+        }
+        let t = ((ms - HOLD) / FADE).clamp(0.0, 1.0);
+        // Ease out: quick at first, settling gently.
+        let a = 1.0 - (1.0 - (1.0 - t).powi(2)).min(1.0);
+        let a = a.max(0.0);
+        let g = &self.gfx;
+        let (w, h) = (self.w, self.h);
+        g.fill_alpha(0.0, 0.0, w, h, 0.0, C::Bg, a);
+        let s = 112.0 * (1.0 + 0.05 * t);
+        let (x, y) = ((w - s) / 2.0, h * 0.40 - s / 2.0);
+        self.draw_logo_alpha(x, y, s, a);
+        let font = g.format("Segoe UI Variable Display", 30.0, DWRITE_FONT_WEIGHT_SEMI_BOLD).or_else(|_| g.format("Segoe UI", 30.0, DWRITE_FONT_WEIGHT_SEMI_BOLD));
+        if let Ok(f) = font {
+            unsafe {
+                let _ = f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                let brush = g.b(C::Fg);
+                brush.SetOpacity(a);
+                let u: Vec<u16> = "Slate".encode_utf16().collect();
+                g.rt().DrawText(&u, &f, &rect(0.0, y + s + 14.0, w, 40.0), brush, Default::default(), Default::default());
+                brush.SetOpacity(1.0);
+                let small = g.ui_small.as_ref().unwrap();
+                let _ = small.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                let dim = g.b(C::Dim);
+                dim.SetOpacity(a);
+                let v: Vec<u16> = format!("Version {}", env!("CARGO_PKG_VERSION")).encode_utf16().collect();
+                g.rt().DrawText(&v, small, &rect(0.0, y + s + 56.0, w, 20.0), dim, Default::default(), Default::default());
+                dim.SetOpacity(1.0);
+                let _ = small.SetTextAlignment(Default::default());
+            }
+        }
+    }
+
+    /// The app icon itself, pixel for pixel, `s` DIPs square at (x, y).
     fn draw_logo(&self, x: f32, y: f32, s: f32) {
+        self.draw_logo_alpha(x, y, s, 1.0);
+    }
+
+    pub(crate) fn draw_logo_alpha(&self, x: f32, y: f32, s: f32, alpha: f32) {
+        use windows::Win32::Graphics::Direct2D::D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+        let g = &self.gfx;
+        let px = (s * self.scale).round() as u32;
+        if let Some(bmp) = g.logo(px, self.scale) {
+            // On whole screen pixels, so the small icon images stay crisp.
+            let snap = |v: f32| (v * self.scale).round() / self.scale;
+            let (x, y) = (snap(x), snap(y));
+            let d = px as f32 / self.scale;
+            unsafe {
+                g.rt().DrawBitmap(&bmp, Some(&rect(x, y, d, d)), alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+            }
+            return;
+        }
+        self.draw_logo_vector(x, y, s);
+    }
+
+    /// Drawn fallback if the icon resource cannot be loaded.
+    fn draw_logo_vector(&self, x: f32, y: f32, s: f32) {
         let g = &self.gfx;
         let tile = g.tint(0x1C2333, 1.0);
         unsafe {
@@ -131,7 +198,7 @@ impl App {
             g.fill_alpha(4.0, 4.0, MENU_W - 8.0, TITLE_H - 8.0, 6.0, C::Hover, ha);
         }
         g.draw_icon(Icon::Menu, 0.0, 0.0, MENU_W, TITLE_H, C::Fg, 16.0, 1.4);
-        self.draw_logo(MENU_W + 1.0, 8.0, 18.0);
+        self.draw_logo(MENU_W + 2.0, (TITLE_H - 20.0) / 2.0, 20.0);
         let b = self.cur_ref();
         let name = match &b.path {
             Some(p) => p.display().to_string(),
@@ -292,15 +359,18 @@ impl App {
 
     fn paint_view(&mut self, v: usize) {
         self.paint_tabs(v);
-        if let Some((done, total)) = &self.buf_of(v).loading {
+        // Until the first piece of a big file arrives, a progress page.
+        if let Some((done, total)) = self.buf_of(v).loading.as_ref().filter(|_| self.buf_of(v).doc.len() == 0) {
             let (vx, _, vw, _) = self.view_rect(v);
             let (_, ty, _, th) = self.text_rect(v);
             let done = done.load(std::sync::atomic::Ordering::Relaxed);
             let frac = if *total == 0 { 0.0 } else { (done as f32 / *total as f32).min(1.0) };
-            let g = &self.gfx;
             let w = (vw - 80.0).min(420.0);
             let x = vx + (vw - w) / 2.0;
             let y = ty + th * 0.38;
+            // The logo above the progress while the first part arrives.
+            self.draw_logo(vx + (vw - 72.0) / 2.0, y - 30.0 - 88.0, 72.0);
+            let g = &self.gfx;
             let name = self.buf_of(v).name();
             let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
             let label = if frac >= 1.0 {
@@ -670,7 +740,21 @@ impl App {
             (None, None) => {
                 let b = self.cur_ref();
                 let n = b.doc.line_count();
-                format!("{} lines  \u{B7}  {} bytes", n, b.doc.len())
+                match b.saving.as_ref().or(b.loading.as_ref()) {
+                    // A huge file saving in the background.
+                    Some((done, total)) if b.saving.is_some() => {
+                        let done = done.load(std::sync::atomic::Ordering::Relaxed);
+                        let pct = if *total == 0 { 100 } else { (done * 100 / *total).min(100) };
+                        format!("Saving {pct}%  \u{B7}  read-only until saved")
+                    }
+                    // A big file still streaming in: how far it has got.
+                    Some((done, total)) => {
+                        let done = done.load(std::sync::atomic::Ordering::Relaxed);
+                        let pct = if *total == 0 { 100 } else { (done * 100 / *total).min(100) };
+                        format!("Loading {pct}%  \u{B7}  {n} lines so far  \u{B7}  read-only until loaded")
+                    }
+                    None => format!("{} lines  \u{B7}  {} bytes", n, b.doc.len()),
+                }
             }
         };
         g.text(&left, small, 12.0, y, (x - 24.0).max(0.0), STATUS_H, C::Dim);

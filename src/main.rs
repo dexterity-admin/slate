@@ -46,6 +46,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+/// Timing trace for performance work: with SLATE_TRACE set to a file
+/// path, appends "<ms since start> <what>" lines to it.
+pub fn trace(what: &str) {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    if let Some(p) = PATH.get_or_init(|| std::env::var("SLATE_TRACE").ok()) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
+            let _ = writeln!(f, "{:>8} {what}", start.elapsed().as_millis());
+        }
+    }
+}
+
 fn app_from(hwnd: HWND) -> Option<&'static mut App> {
     unsafe {
         let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
@@ -317,6 +332,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
                 let _ = SetForegroundWindow(hwnd);
+                // Files handed to this window: greet them with the splash.
+                a.splash_since = Some(std::time::Instant::now());
+                a.redraw();
             }
             return LRESULT(1);
         }
@@ -331,6 +349,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let l = Box::from_raw(lp.0 as *mut app::Loaded);
             a.on_loaded(*l);
         }
+        app::WM_SAVED => {
+            let s = Box::from_raw(lp.0 as *mut app::Saved);
+            a.on_saved(*s);
+        }
         net::WM_NET => {
             let e = Box::from_raw(lp.0 as *mut net::Event);
             a.on_net(*e);
@@ -343,9 +365,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.fif_done(*s);
         }
         WM_CLOSE => {
+            // Wait for background saves; the window closes after them.
+            if a.bufs.iter().any(|b| b.saving.is_some()) {
+                a.close_after_save = true;
+                a.flash("Saving\u{2026} Slate closes when the save is done");
+                return LRESULT(0);
+            }
             if !BENCH && !a.exiting_for_update {
                 let restore = settings::get().restore_session;
                 if restore && !a.no_session {
+                    // Huge files get no backup copy, so unsaved changes in
+                    // them need an answer now.
+                    while let Some((v, i)) = (0..2).find_map(|v| {
+                        a.views[v].tabs.iter().position(|t| {
+                            let b = &a.bufs[a.bi(t.buf)];
+                            b.dirty() && b.doc.len() >= app::HUGE
+                        }).map(|i| (v, i))
+                    }) {
+                        if !a.close_tab(v, i) {
+                            return LRESULT(0);
+                        }
+                    }
                     a.save_session();
                 } else {
                     // Without session restore, unsaved work needs an answer.
@@ -519,6 +559,11 @@ fn main() {
         if let Some(a) = app_from(hwnd) {
             a.finish_handover();
             a.schedule_update_checks();
+            // The splash, except for benchmarks and an update taking over.
+            if !bench && a.upd.handover.is_none() {
+                a.splash_since = Some(std::time::Instant::now());
+                a.redraw();
+            }
         }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
