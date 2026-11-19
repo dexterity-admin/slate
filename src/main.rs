@@ -7,6 +7,7 @@ mod buffer;
 mod collab;
 mod compare;
 mod csv;
+mod dialog;
 mod diff;
 mod doc;
 mod grid;

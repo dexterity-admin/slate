@@ -477,10 +477,13 @@ impl App {
             // Say so when someone runs another version of Slate.
             let ver = if p.version != env!("CARGO_PKG_VERSION") { format!(" \u{B7} Slate {}", p.version) } else { String::new() };
             items.push(PalItem { label: p.name.clone(), hint: format!("{} \u{B7} {summary}{ver}", p.pc), act: PalAct::Cmd(crate::app::Cmd::TeamPeople) });
-            for f in &p.files {
+            // Files shared live first.
+            let mut files: Vec<&PeerFile> = p.files.iter().collect();
+            files.sort_by_key(|f| !p.sessions.iter().any(|s| s.path == f.path));
+            for f in files {
                 let session = p.sessions.iter().find(|s| s.path == f.path);
                 let st = match (session.is_some(), f.state) {
-                    (true, _) => "co-editing \u{2013} pick to join \u{B7} ",
+                    (true, _) => "LIVE \u{2013} pick to join \u{B7} ",
                     (_, FileState::Open) => "",
                     (_, FileState::Editing) => "editing \u{B7} ",
                     (_, FileState::Locked) => "locked \u{B7} ",
@@ -497,7 +500,8 @@ impl App {
                     None => PalAct::CoAsk(p.id, f.path.clone()),
                 };
                 let hint = if session.is_none() && !reachable { format!("{st}on {}\u{2019}s PC \u{2013} pick to ask to co-edit", p.name) } else { format!("{st}{dir}") };
-                items.push(PalItem { label: format!("      {name}"), hint, act });
+                let mark = if session.is_some() { "\u{25CF} " } else { "" };
+                items.push(PalItem { label: format!("      {mark}{name}"), hint, act });
             }
         }
         for h in t.hubs() {

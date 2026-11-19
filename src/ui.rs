@@ -105,9 +105,73 @@ impl App {
         let extra = if self.team_online().len() > PEOPLE_MAX { 26.0 } else { 0.0 };
         // You stand apart; the others overlap a little.
         let others = (n - 1) as f32;
-        let w = AVATAR + if others > 0.0 { 6.0 + AVATAR + (others - 1.0) * (AVATAR - 6.0) } else { 0.0 } + extra + 12.0;
+        let w = AVATAR + if others > 0.0 { 6.0 + AVATAR + (others - 1.0) * (AVATAR - 6.0) } else { 0.0 } + extra + 12.0 + self.shared_pill_w();
         let right = self.w - 3.0 * CAP_W - 8.0 - if self.recording.is_some() { 130.0 } else { 0.0 };
         Some(r(right - w, (TITLE_H - AVATAR) / 2.0 - 2.0, w, AVATAR + 4.0))
+    }
+
+    /// Text of the title-bar pill counting files others share live.
+    pub fn shared_pill(&self) -> Option<String> {
+        match self.shared_by_others() {
+            0 => None,
+            1 => Some("\u{25CF} 1 file shared live".into()),
+            n => Some(format!("\u{25CF} {n} files shared live")),
+        }
+    }
+
+    pub fn shared_pill_w(&self) -> f32 {
+        self.shared_pill().map_or(0.0, |s| self.text_w(&s, true) + 24.0)
+    }
+
+    /// The live co-editing card at the top right of view `v`'s text, and
+    /// its Stop button, while that view's file is co-edited.
+    pub fn live_card(&self, v: usize) -> Option<(Rect, Rect)> {
+        let b = self.buf_of(v);
+        b.collab.as_ref()?;
+        if b.grid.is_some() {
+            return None;
+        }
+        let (line1, line2, btn) = self.live_card_text(v)?;
+        let tw = self.text_w(&line1, false).max(self.text_w(&line2, true)) + 34.0;
+        let bw = self.text_w(&btn, false) + 26.0;
+        let (vx, vy, vw, _) = self.view_rect(v);
+        let w = (tw + bw + 22.0).min(vw - SCROLL_W - 24.0).max(200.0);
+        let h = 50.0;
+        let card = r(vx + vw - SCROLL_W - 12.0 - w, vy + TAB_H + 10.0, w, h);
+        let button = r(card.x + card.w - bw - 12.0, card.y + (h - 26.0) / 2.0, bw, 26.0);
+        Some((card, button))
+    }
+
+    /// (heading, explanation, button) of the live card of view `v`.
+    pub fn live_card_text(&self, v: usize) -> Option<(String, String, String)> {
+        let bi = self.bi(self.views[v].tabs.get(self.views[v].active)?.buf);
+        let c = self.bufs[bi].collab.as_ref()?;
+        let people = self.collab_people(bi);
+        let who: Vec<&str> = people.iter().map(|s| s.as_str()).collect();
+        let head = match c.core.phase {
+            crate::collab::Phase::Joining => "Joining\u{2026}".to_string(),
+            crate::collab::Phase::Electing | crate::collab::Phase::Resuming => "Reconnecting\u{2026}".to_string(),
+            _ if who.is_empty() => "Shared live \u{2013} waiting for others".to_string(),
+            _ => format!("Live with {}", crate::team::join_names(&who)),
+        };
+        let (line2, btn) = match c.owner {
+            Some(o) => {
+                let name = self.team.as_ref().and_then(|t| t.peers.get(&o)).map(|p| p.name.clone()).unwrap_or_default();
+                (format!("{name}\u{2019}s file \u{2013} Ctrl+S saves it on their PC"), "Leave".to_string())
+            }
+            None if who.is_empty() => ("Only this file is shared \u{2013} others join from Who\u{2019}s Online".to_string(), "Stop sharing".to_string()),
+            None => ("Only this file is shared; your other tabs stay private".to_string(), "Stop sharing".to_string()),
+        };
+        Some((head, line2, btn))
+    }
+
+    /// The co-editing pill on a tab: ("LIVE", true) while co-edited here,
+    /// ("JOIN", false) while others co-edit it and this Slate could join.
+    pub fn tab_pill(&self, bi: usize) -> Option<(&'static str, bool)> {
+        if self.bufs[bi].collab.is_some() {
+            return Some(("\u{25CF} LIVE", true));
+        }
+        self.collab_offer_for(bi).map(|_| ("JOIN", false))
     }
 
     /// Tab rectangles of view `v` and the "+" button.
@@ -119,7 +183,8 @@ impl App {
             .map(|t| {
                 let b = &self.bufs[self.bi(t.buf)];
                 let badge_w = badge(b).map(|(l, _)| self.text_w(&l, true) + 17.0).unwrap_or(0.0);
-                (self.text_w(&b.name(), false) + 56.0 + badge_w).clamp(96.0, 280.0)
+                let live_w = self.tab_pill(self.bi(t.buf)).map(|(l, _)| self.text_w(l, true) + 17.0).unwrap_or(0.0);
+                (self.text_w(&b.name(), false) + 56.0 + badge_w + live_w).clamp(96.0, 320.0)
             })
             .collect();
         let avail = vw - 8.0 - 36.0;
@@ -284,6 +349,11 @@ impl App {
                 return Hit::NewTab(v);
             }
             return Hit::TabStrip(v);
+        }
+        if let Some((card, button)) = self.live_card(v) {
+            if card.has(x, y) {
+                return Hit::Live(v, button.has(x, y));
+            }
         }
         if self.buf_of(v).grid.is_some() && self.buf_of(v).loading.is_none() {
             return Hit::Grid(v);

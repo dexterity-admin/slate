@@ -15,6 +15,9 @@ use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE
 
 const D2DERR_RECREATE_TARGET: i32 = 0x8899000Cu32 as i32;
 
+/// The colour of live co-editing.
+pub const LIVE_RGB: u32 = 0x2DA44E;
+
 impl App {
     pub fn paint(&mut self) {
         if self.gfx.rt.is_none() || self.views[0].tabs.is_empty() {
@@ -45,6 +48,7 @@ impl App {
         }
         for v in 0..views {
             self.paint_view(v);
+            self.paint_live_card(v);
         }
         if self.split {
             let sx = self.view_rect(1).0 - 1.0;
@@ -233,6 +237,18 @@ impl App {
             let me = crate::team::my_name();
             let y = rc.y + 2.0;
             let mut x = rc.x + 6.0;
+            // Files others share live, in plain sight: a click lists them.
+            if let Some(pill) = self.shared_pill() {
+                let pw = self.shared_pill_w() - 8.0;
+                unsafe {
+                    let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(x - 2.0, y + 1.0, pw, AVATAR - 2.0), radiusX: (AVATAR - 2.0) / 2.0, radiusY: (AVATAR - 2.0) / 2.0 };
+                    g.rt().FillRoundedRectangle(&rr, &g.tint(LIVE_RGB, 0.16));
+                    g.rt().DrawRoundedRectangle(&rr, &g.tint(LIVE_RGB, 0.9), 1.0, None);
+                    let u: Vec<u16> = pill.encode_utf16().collect();
+                    g.rt().DrawText(&u, g.ui_small.as_ref().unwrap(), &rect(x + 8.0, y + 1.0, pw, AVATAR - 2.0), &g.tint(LIVE_RGB, 1.0), Default::default(), Default::default());
+                }
+                x += pw + 6.0;
+            }
             // You first, as an outline; dimmed while the folder is unreachable.
             self.draw_avatar(x, y, &crate::team::initials(&me), crate::team::color_for(&me), false, reachable);
             x += AVATAR + 6.0;
@@ -339,9 +355,24 @@ impl App {
                     g.rt().FillRoundedRectangle(&rr, &g.tint(*rgb, alpha));
                 }
             }
-            let live = b.collab.is_some();
-            let name = if live { format!("{} \u{25CF}", b.name()) } else { b.name() };
-            g.text(&name, f.unwrap(), tx, t.y, t.x + t.w - 30.0 - dots - tx, t.h - 1.0, fg);
+            if let Some((label, on)) = self.tab_pill(self.bi(tab.buf)) {
+                let bw = self.text_w(label, true) + 10.0;
+                let by = t.y + (t.h - 17.0) / 2.0;
+                unsafe {
+                    let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(tx, by, bw, 17.0), radiusX: 8.5, radiusY: 8.5 };
+                    if on {
+                        g.rt().FillRoundedRectangle(&rr, &g.tint(LIVE_RGB, 1.0));
+                    } else {
+                        g.rt().FillRoundedRectangle(&rr, &g.tint(LIVE_RGB, 0.14));
+                        g.rt().DrawRoundedRectangle(&rr, &g.tint(LIVE_RGB, 1.0), 1.0, None);
+                    }
+                    let u: Vec<u16> = label.encode_utf16().collect();
+                    let tc = if on { g.tint(0xFFFFFF, 1.0) } else { g.tint(LIVE_RGB, 1.0) };
+                    g.rt().DrawText(&u, small, &rect(tx + 5.0, by, bw, 17.0), &tc, Default::default(), Default::default());
+                }
+                tx += bw + 7.0;
+            }
+            g.text(&b.name(), f.unwrap(), tx, t.y, t.x + t.w - 30.0 - dots - tx, t.h - 1.0, fg);
             let close_hover = self.hover == Hit::TabClose(v, i);
             if close_hover {
                 g.fill_alpha(cr.x, cr.y, cr.w, cr.h, 4.0, C::Hover, 1.0);
@@ -373,6 +404,35 @@ impl App {
         }
         g.draw_icon(Icon::Plus, plus.x, plus.y, plus.w, plus.h, C::Dim, 12.0, 1.3);
         g.unclip();
+    }
+
+    /// The live co-editing card: who is here, that only this file is
+    /// shared, and a button to stop.
+    fn paint_live_card(&self, v: usize) {
+        let Some((card, btn)) = self.live_card(v) else { return };
+        let Some((head, line2, label)) = self.live_card_text(v) else { return };
+        let g = &self.gfx;
+        g.fill_round(card.x - 1.0, card.y + 1.0, card.w + 2.0, card.h + 2.0, 9.0, C::Border);
+        g.fill_round(card.x, card.y, card.w, card.h, 8.0, C::Popup);
+        unsafe {
+            let rr = windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT { rect: rect(card.x, card.y, card.w, card.h), radiusX: 8.0, radiusY: 8.0 };
+            g.rt().FillRoundedRectangle(&rr, &g.tint(LIVE_RGB, if g.dark { 0.10 } else { 0.07 }));
+            g.rt().DrawRoundedRectangle(&rr, &g.tint(LIVE_RGB, 0.7), 1.0, None);
+            // A soft halo round the dot says "on air".
+            let pulse = 0.25;
+            let e = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE { point: windows::Win32::Graphics::Direct2D::Common::D2D_POINT_2F { x: card.x + 17.0, y: card.y + 17.0 }, radiusX: 7.5, radiusY: 7.5 };
+            g.rt().FillEllipse(&e, &g.tint(LIVE_RGB, pulse));
+            let e = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE { radiusX: 4.0, radiusY: 4.0, ..e };
+            g.rt().FillEllipse(&e, &g.tint(LIVE_RGB, 1.0));
+        }
+        let tw = btn.x - card.x - 38.0;
+        g.text(&head, g.ui_bold.as_ref().unwrap(), card.x + 30.0, card.y + 6.0, tw, 22.0, C::Fg);
+        g.text(&line2, g.ui_small.as_ref().unwrap(), card.x + 30.0, card.y + 25.0, tw + 8.0, 18.0, C::Dim);
+        let hot = self.hover == Hit::Live(v, true);
+        g.fill_round(btn.x, btn.y, btn.w, btn.h, 5.0, if hot { C::Hover } else { C::Popup });
+        g.stroke_round(btn.x, btn.y, btn.w, btn.h, 5.0, C::Border, 1.0);
+        let tw = self.text_w(&label, false);
+        g.text(&label, g.ui.as_ref().unwrap(), btn.x + (btn.w - tw) / 2.0, btn.y, tw + 4.0, btn.h, C::Fg);
     }
 
     fn paint_view(&mut self, v: usize) {

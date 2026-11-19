@@ -11,11 +11,6 @@ use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST,
     OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, MessageBoxW, TrackPopupMenu, MB_ICONINFORMATION,
-    MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_RESULT, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-};
 
 const CF_UNICODETEXT: u32 = 13;
 
@@ -150,7 +145,7 @@ pub fn get_clipboard(hwnd: HWND) -> Option<(Vec<u8>, bool)> {
 
 const FILTER: &str = "All files (*.*)\0*.*\0Text (*.txt;*.log;*.md)\0*.txt;*.log;*.md\0Source code\0*.c;*.cpp;*.h;*.hpp;*.cs;*.rs;*.py;*.js;*.ts;*.java;*.go;*.ps1;*.bat;*.cmd;*.sh;*.sql\0Markup / data\0*.xml;*.html;*.htm;*.json;*.yml;*.yaml;*.ini;*.toml;*.csv\0\0";
 
-pub fn open_dialog(hwnd: HWND, dir: Option<&str>) -> Vec<String> {
+fn open_dialog_legacy(hwnd: HWND, dir: Option<&str>) -> Vec<String> {
     let filter: Vec<u16> = FILTER.encode_utf16().collect();
     let mut buf = vec![0u16; 32768];
     let d = dir.map(wide);
@@ -179,7 +174,7 @@ pub fn open_dialog(hwnd: HWND, dir: Option<&str>) -> Vec<String> {
     parts[1..].iter().map(|f| base.join(f).to_string_lossy().into_owned()).collect()
 }
 
-pub fn save_dialog(hwnd: HWND, suggested: &str, dir: Option<&str>) -> Option<String> {
+fn save_dialog_legacy(hwnd: HWND, suggested: &str, dir: Option<&str>) -> Option<String> {
     let filter: Vec<u16> = FILTER.encode_utf16().collect();
     let mut buf = vec![0u16; 4096];
     for (i, c) in suggested.encode_utf16().take(4000).enumerate() {
@@ -203,59 +198,143 @@ pub fn save_dialog(hwnd: HWND, suggested: &str, dir: Option<&str>) -> Option<Str
     Some(String::from_utf16_lossy(&buf[..n]))
 }
 
+/// The file types offered by the Open and Save dialogs: (name, patterns).
+const TYPES: [(&str, &str); 4] = [
+    ("All files", "*.*"),
+    ("Text", "*.txt;*.log;*.md"),
+    ("Source code", "*.c;*.cpp;*.h;*.hpp;*.cs;*.rs;*.py;*.js;*.ts;*.java;*.go;*.ps1;*.bat;*.cmd;*.sh;*.sql"),
+    ("Markup / data", "*.xml;*.html;*.htm;*.json;*.yml;*.yaml;*.ini;*.toml;*.csv"),
+];
+
+mod modern {
+    use super::{wide, TYPES};
+    use windows::core::{Interface, Result, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName,
+        FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, SIGDN_FILESYSPATH,
+    };
+
+    fn path_of(item: &IShellItem) -> Result<String> {
+        unsafe {
+            let p = item.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const _));
+            Ok(s)
+        }
+    }
+
+    /// File types and start folder, shared by both dialogs.
+    fn prepare(d: &IFileDialog, dir: Option<&str>) -> Result<()> {
+        let names: Vec<(Vec<u16>, Vec<u16>)> = TYPES.iter().map(|(n, p)| (wide(n), wide(p))).collect();
+        let specs: Vec<COMDLG_FILTERSPEC> = names.iter().map(|(n, p)| COMDLG_FILTERSPEC { pszName: PCWSTR(n.as_ptr()), pszSpec: PCWSTR(p.as_ptr()) }).collect();
+        unsafe {
+            d.SetFileTypes(&specs)?;
+            if let Some(dir) = dir {
+                let w = wide(dir);
+                if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(w.as_ptr()), None) {
+                    let _ = d.SetFolder(&item);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Ok(false) when the person cancelled; any other failure is an error,
+    /// so the caller can fall back to the old dialog.
+    fn shown(r: Result<()>) -> Result<bool> {
+        const CANCELLED: i32 = 0x800704C7u32 as i32;
+        match r {
+            Ok(()) => Ok(true),
+            Err(e) if e.code().0 == CANCELLED => Ok(false),
+            Err(e) => {
+                crate::trace(&format!("file dialog: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Ok(None) when the person cancelled.
+    pub fn open(hwnd: HWND, dir: Option<&str>) -> Result<Option<Vec<String>>> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            d.SetOptions(d.GetOptions()? | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM)?;
+            prepare(&d.cast()?, dir)?;
+            if !shown(d.Show(hwnd))? {
+                return Ok(None);
+            }
+            let items = d.GetResults()?;
+            let mut out = Vec::new();
+            for i in 0..items.GetCount()? {
+                out.push(path_of(&items.GetItemAt(i)?)?);
+            }
+            Ok(Some(out))
+        }
+    }
+
+    pub fn save(hwnd: HWND, suggested: &str, dir: Option<&str>) -> Result<Option<String>> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let d: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)?;
+            d.SetOptions(d.GetOptions()? | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM)?;
+            prepare(&d.cast()?, dir)?;
+            let name = wide(suggested);
+            d.SetFileName(PCWSTR(name.as_ptr()))?;
+            if !shown(d.Show(hwnd))? {
+                return Ok(None);
+            }
+            Ok(Some(path_of(&d.GetResult()?)?))
+        }
+    }
+}
+
+/// The Windows Explorer file dialog (with the old one as a fallback).
+pub fn open_dialog(hwnd: HWND, dir: Option<&str>) -> Vec<String> {
+    match modern::open(hwnd, dir) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(_) => open_dialog_legacy(hwnd, dir),
+    }
+}
+
+pub fn save_dialog(hwnd: HWND, suggested: &str, dir: Option<&str>) -> Option<String> {
+    match modern::save(hwnd, suggested, dir) {
+        Ok(v) => v,
+        Err(_) => save_dialog_legacy(hwnd, suggested, dir),
+    }
+}
+
 pub enum Answer {
     Yes,
     No,
     Cancel,
 }
 
+use crate::dialog::{self, Mark, Spec};
+
 pub fn ask_save(hwnd: HWND, name: &str) -> Answer {
-    let t = wide(&format!("Save changes to \"{name}\"?"));
-    let r = unsafe { MessageBoxW(hwnd, PCWSTR(t.as_ptr()), w!("Slate"), MB_YESNOCANCEL | MB_ICONWARNING) };
-    match r {
-        MESSAGEBOX_RESULT(6) => Answer::Yes,
-        MESSAGEBOX_RESULT(7) => Answer::No,
+    let spec = Spec::new(Mark::Warn, &format!("Save changes to \u{201C}{name}\u{201D}?"), "Your changes are lost if you don\u{2019}t save them.").buttons(&["Save", "Don\u{2019}t save", "Cancel"], 0, 2);
+    match dialog::show(hwnd, spec) {
+        0 => Answer::Yes,
+        1 => Answer::No,
         _ => Answer::Cancel,
     }
 }
 
-pub fn ask_yes_no_cancel(hwnd: HWND, text: &str) -> Answer {
-    let t = wide(text);
-    let r = unsafe { MessageBoxW(hwnd, PCWSTR(t.as_ptr()), w!("Slate update"), MB_YESNOCANCEL | MB_ICONINFORMATION) };
-    match r {
-        MESSAGEBOX_RESULT(6) => Answer::Yes,
-        MESSAGEBOX_RESULT(7) => Answer::No,
-        _ => Answer::Cancel,
-    }
+/// Asks before something that loses work: true for `yes`.
+pub fn confirm(hwnd: HWND, title: &str, body: &str, yes: &str, no: &str) -> bool {
+    dialog::show(hwnd, Spec::new(Mark::Warn, title, body).buttons(&[yes, no], 0, 1)) == 0
 }
 
-pub fn ask_yes_no(hwnd: HWND, text: &str) -> bool {
-    let t = wide(text);
-    unsafe { MessageBoxW(hwnd, PCWSTR(t.as_ptr()), w!("Slate"), MB_YESNO | MB_ICONWARNING) == MESSAGEBOX_RESULT(6) }
+/// Reports a problem.
+pub fn error(hwnd: HWND, title: &str, body: &str) {
+    dialog::show(hwnd, Spec::new(Mark::Danger, title, body));
 }
 
-pub fn info(hwnd: HWND, text: &str) {
-    let t = wide(text);
-    unsafe {
-        MessageBoxW(hwnd, PCWSTR(t.as_ptr()), w!("Slate"), MB_OK | MB_ICONINFORMATION);
-    }
-}
-
-/// Shows a popup menu of `(id, label, enabled)`; id 0 is a separator.
+/// Shows a popup menu of `(id, label, enabled)`; id 0 is a separator and
+/// a tab in a label puts its shortcut on the right.
 pub fn popup_menu(hwnd: HWND, screen: POINT, items: &[(u32, &str, bool)]) -> u32 {
-    unsafe {
-        let Ok(m) = CreatePopupMenu() else { return 0 };
-        for (id, label, en) in items {
-            if *id == 0 {
-                let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
-            } else {
-                let t = wide(label);
-                let flags = if *en { MF_STRING } else { MF_STRING | MF_GRAYED };
-                let _ = AppendMenuW(m, flags, *id as usize, PCWSTR(t.as_ptr()));
-            }
-        }
-        let r = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd, None);
-        let _ = DestroyMenu(m);
-        r.0 as u32
-    }
+    crate::dialog::menu(hwnd, screen, items)
 }

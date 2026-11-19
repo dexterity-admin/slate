@@ -736,6 +736,20 @@ impl App {
         best.map(|(g, h)| (g, h, names))
     }
 
+    /// Files others co-edit that this Slate is not in.
+    pub fn shared_by_others(&self) -> usize {
+        let Some(t) = &self.team else { return 0 };
+        let mut sids: Vec<u64> = Vec::new();
+        for p in t.people() {
+            for s in &p.sessions {
+                if !sids.contains(&s.sid) && self.collab_bi(s.sid).is_none() {
+                    sids.push(s.sid);
+                }
+            }
+        }
+        sids.len()
+    }
+
     fn peer_name(&self, id: u64) -> String {
         self.team.as_ref().and_then(|t| t.peers.get(&id)).map(|p| p.name.clone()).unwrap_or_else(|| "The other person".into())
     }
@@ -898,7 +912,7 @@ impl App {
         let path = t.shared(b.path.as_ref().unwrap());
         match self.session_for(bi) {
             Some((sid, _gen, host, names)) if t.net.connected(host) => {
-                if self.bufs[bi].dirty() && !crate::sys::ask_yes_no(self.hwnd, "Join co-editing?\n\nYour unsaved changes to this file are replaced by the shared text.") {
+                if self.bufs[bi].dirty() && !crate::sys::confirm(self.hwnd, "Join co-editing?", "Your unsaved changes to this file are replaced by the shared text.", "Join", "Cancel") {
                     return;
                 }
                 let (core, outs) = Core::join(me, sid, host);
@@ -914,7 +928,7 @@ impl App {
                 let gen = crate::net::new_id();
                 self.bufs[bi].collab = Some(Box::new(Collab { core: Core::host(me, sid, gen), path, outbox: Vec::new(), muted: false, owner: None }));
                 self.bufs[bi].lock_since = None;
-                self.flash("Co-editing on: others who open this file can join with Ctrl+Shift+E");
+                self.flash("Shared live: only this file \u{2013} others pick it under Who\u{2019}s Online to join");
             }
         }
         self.team_publish();
@@ -1253,8 +1267,8 @@ impl App {
         Some(match c.core.phase {
             Phase::Joining => "Co-editing \u{2013} joining\u{2026}".to_string(),
             Phase::Electing | Phase::Resuming => "Co-editing \u{2013} reconnecting\u{2026}".to_string(),
-            Phase::Live if who.is_empty() => "Co-editing \u{2013} waiting for others".to_string(),
-            Phase::Live => format!("Co-editing with {}", team::join_names(&who)),
+            Phase::Live if who.is_empty() => "\u{25CF} Shared live \u{2013} waiting for others".to_string(),
+            Phase::Live => format!("\u{25CF} Live with {}", team::join_names(&who)),
         })
     }
 }

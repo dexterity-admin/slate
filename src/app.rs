@@ -437,6 +437,8 @@ pub enum Hit {
     /// A toolbar button (index into toolbar::TOOLS), or the bar around them.
     Tool(usize),
     ToolBar,
+    /// The live co-editing card over view `v`; `true` for its Stop button.
+    Live(usize, bool),
 }
 
 pub enum Drag {
@@ -892,8 +894,7 @@ impl App {
             enc::write_encoded(&mut w, parts, enc, eol, &mut |_| {})
         });
         if let Err(e) = r {
-            let msg = format!("Could not save {}:\n{e}", path.display());
-            sys::info(self.hwnd, &msg);
+            sys::error(self.hwnd, &format!("Could not save {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()), &format!("{}\n\n{e}", path.display()));
             return false;
         }
         self.finish_save(i, path);
@@ -963,8 +964,7 @@ impl App {
             match s.result {
                 Ok(()) => self.finish_save(i, s.path),
                 Err(e) => {
-                    let msg = format!("Could not save {}:\n{e}", s.path.display());
-                    sys::info(self.hwnd, &msg);
+                    sys::error(self.hwnd, &format!("Could not save {}", s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()), &format!("{}\n\n{e}", s.path.display()));
                 }
             }
         }
@@ -1514,7 +1514,8 @@ impl App {
             let i = self.bi(id);
             let name = self.bufs[i].path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
             self.bufs[i].mtime = self.bufs[i].path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            if sys::ask_yes_no(self.hwnd, &format!("{name}\n\nThis file was changed by another program. Reload it and lose your unsaved changes?")) {
+            let short = std::path::Path::new(&name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if sys::confirm(self.hwnd, &format!("{short} changed on disk"), &format!("Another program changed this file. Reload it and lose your unsaved changes here?\n\n{name}"), "Reload", "Keep mine") {
                 self.reload(id, None);
             }
         }
@@ -1849,6 +1850,66 @@ impl App {
         p.scroll = 0;
     }
 
+    /// The ≡ menu: everyday commands, Settings, updates and About in plain
+    /// sight, for those who do not use the command palette.
+    pub fn app_menu(&mut self) {
+        let co = if self.cur_ref().collab.is_some() { "Stop Co-editing This File" } else { "Co-edit This File\u{2026}" };
+        let upd = match &self.upd.available {
+            Some(m) => format!("Install Slate {}\u{2026}", m.version),
+            None => "Check for Updates\u{2026}".to_string(),
+        };
+        // (id, label, command); id 0 is a separator.
+        let list: Vec<(u32, String, Option<Cmd>)> = vec![
+            (1, "New".into(), Some(Cmd::New)),
+            (2, "Open\u{2026}".into(), Some(Cmd::Open)),
+            (3, "Open Recent\u{2026}".into(), Some(Cmd::Recent)),
+            (4, "Save".into(), Some(Cmd::Save)),
+            (5, "Save As\u{2026}".into(), Some(Cmd::SaveAs)),
+            (6, "Save All".into(), Some(Cmd::SaveAll)),
+            (0, String::new(), None),
+            (7, "Find\u{2026}".into(), Some(Cmd::Find)),
+            (8, "Replace\u{2026}".into(), Some(Cmd::Replace)),
+            (9, "Find in Files\u{2026}".into(), Some(Cmd::FindInFiles)),
+            (0, String::new(), None),
+            (10, co.into(), Some(Cmd::CoEdit)),
+            (11, "Who\u{2019}s Online\u{2026}".into(), Some(Cmd::TeamPeople)),
+            (0, String::new(), None),
+            (12, "Settings\u{2026}".into(), None),
+            (13, "All Commands\u{2026}".into(), Some(Cmd::Palette)),
+            (0, String::new(), None),
+            (14, upd, Some(if self.upd.available.is_some() { Cmd::InstallUpdate } else { Cmd::CheckUpdates })),
+            (15, "About Slate".into(), Some(Cmd::About)),
+        ];
+        let items: Vec<(u32, String, bool)> = list
+            .iter()
+            .map(|(id, label, cmd)| {
+                let key = cmd.and_then(|c| COMMANDS.iter().find(|x| x.0 == c)).map(|x| x.2).unwrap_or("");
+                let key = if *id == 12 { "" } else if *id == 13 { "Ctrl+Shift+P" } else { key };
+                let enabled = match id {
+                    10 | 11 => self.team.is_some(),
+                    14 => self.updates_enabled(),
+                    _ => true,
+                };
+                (*id, if key.is_empty() { label.clone() } else { format!("{label}\t{key}") }, enabled)
+            })
+            .collect();
+        let refs: Vec<(u32, &str, bool)> = items.iter().map(|(i, l, e)| (*i, l.as_str(), *e)).collect();
+        let at = crate::dialog::below(self.hwnd, 4.0, crate::app::TITLE_H, self.scale);
+        self.redraw();
+        match crate::dialog::menu(self.hwnd, at, &refs) {
+            0 => {}
+            12 => {
+                let items = COMMANDS.iter().filter(|(_, l, _)| l.starts_with("Settings:") || l.starts_with("View:")).map(|(c, l, k)| PalItem { label: l.to_string(), hint: k.to_string(), act: PalAct::Cmd(*c) }).collect();
+                self.open_palette(PalMode::Commands, "Settings", items, "");
+            }
+            id => {
+                if let Some(c) = list.iter().find(|x| x.0 == id).and_then(|x| x.2) {
+                    self.exec(c);
+                }
+            }
+        }
+    }
+
     pub fn command_palette(&mut self) {
         let items = COMMANDS
             .iter()
@@ -1937,7 +1998,7 @@ impl App {
             }
             PalAct::Reopen(e) => {
                 let id = self.cur_ref().id;
-                if self.cur_ref().dirty() && !sys::ask_yes_no(self.hwnd, "Reopening discards your unsaved changes. Continue?") {
+                if self.cur_ref().dirty() && !sys::confirm(self.hwnd, "Reopen with another encoding?", "Reopening discards your unsaved changes.", "Reopen", "Cancel") {
                     return;
                 }
                 self.reload(id, Some(e));
@@ -2276,7 +2337,7 @@ impl App {
             }
             Cmd::Reload => {
                 let id = self.cur_ref().id;
-                if !self.cur_ref().dirty() || sys::ask_yes_no(hwnd, "Reload from disk and lose your unsaved changes?") {
+                if !self.cur_ref().dirty() || sys::confirm(hwnd, "Reload from disk?", "Your unsaved changes are lost.", "Reload", "Cancel") {
                     self.reload(id, None);
                 }
             }
@@ -2727,12 +2788,7 @@ impl App {
                 changed = false;
             }
             Cmd::About => {
-                let msg = format!(
-                    "Slate {}\nA small, fast text editor.\n\nSettings and session: {}\nPress Ctrl+Shift+P (or F1) for every command.",
-                    env!("CARGO_PKG_VERSION"),
-                    settings::dir().display()
-                );
-                sys::info(hwnd, &msg);
+                self.about();
                 changed = false;
             }
         }

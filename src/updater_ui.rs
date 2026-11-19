@@ -3,6 +3,7 @@
 
 use crate::app::App;
 use crate::settings;
+use crate::dialog::{Mark, Spec};
 use crate::sys;
 use crate::update::{self, Manifest, UpdateMsg};
 use std::path::PathBuf;
@@ -82,17 +83,61 @@ impl App {
                 self.upd.available = None;
                 if manual {
                     self.flash(&format!("Slate {} is up to date", update::current_version()));
+                    self.redraw();
+                    let spec = Spec::new(Mark::Logo, "Slate is up to date", &format!("You have the latest version, {}.", update::current_version()));
+                    crate::dialog::show(self.hwnd, spec);
                 }
             }
             UpdateMsg::Failed(e) => {
                 // Background checks fail quietly (offline, no release yet).
                 if manual {
-                    self.flash(&format!("Update check failed: {e}"));
+                    self.flash("Update check failed");
+                    self.redraw();
+                    sys::error(self.hwnd, "Couldn\u{2019}t check for updates", &format!("{e}\n\nCheck the network connection and try again, or get the latest version from the website."));
                 }
             }
             UpdateMsg::Ready(m, path) => self.apply_update(m, path),
         }
         self.redraw();
+    }
+
+    /// Slate's About page: version, update status, where settings live.
+    pub fn about(&mut self) {
+        let ver = update::current_version();
+        let (status, button) = match (&self.upd.available, self.upd.busy) {
+            (Some(m), _) => (format!("Slate {} is available", m.version), format!("Install {}", m.version)),
+            (None, true) => ("Checking\u{2026}".to_string(), "Check for updates".to_string()),
+            (None, false) if !self.updates_enabled() => ("Off in this window".to_string(), "Check for updates".to_string()),
+            (None, false) => (if settings::get().auto_update { "Checked automatically every 6 hours".to_string() } else { "Automatic checks are off".to_string() }, "Check for updates".to_string()),
+        };
+        let dir = settings::dir().display().to_string();
+        let site = "https://dexterity-admin.github.io/slate/";
+        let releases = format!("https://github.com/{}/releases", update::REPO);
+        let spec = Spec {
+            mark: Mark::Logo,
+            title: "Slate".into(),
+            sub: "A small, fast text editor for engineering work.".into(),
+            body: String::new(),
+            rows: vec![
+                ("Version".into(), ver.to_string(), None),
+                ("Updates".into(), status, None),
+                ("Settings folder".into(), dir.clone(), Some(dir)),
+                ("Website".into(), "dexterity-admin.github.io/slate".into(), Some(site.into())),
+                ("What\u{2019}s new".into(), "Release notes on GitHub".into(), Some(releases)),
+                ("Every command".into(), "Ctrl+Shift+P or F1".into(), None),
+            ],
+            buttons: vec![button, "Close".into()],
+            primary: 1,
+            cancel: 1,
+            width: 500.0,
+        };
+        if crate::dialog::show(self.hwnd, spec) == 0 {
+            if self.upd.available.is_some() {
+                self.install_update();
+            } else {
+                self.start_check(true);
+            }
+        }
     }
 
     /// Asks, then downloads and installs the available update.
@@ -101,16 +146,28 @@ impl App {
             self.start_check(true);
             return;
         };
-        let notes = if m.notes.is_empty() { String::new() } else { format!("\n\nWhat's new:\n{}", m.notes) };
-        let text = format!(
-            "Install Slate {} now? (you have {})\n\nSlate restarts and reopens all your tabs, including unsaved text.{notes}\n\nChoose No to be reminded later, or Cancel to skip this version.",
-            m.version,
-            update::current_version()
-        );
-        match sys::ask_yes_no_cancel(self.hwnd, &text) {
-            sys::Answer::Yes => {}
-            sys::Answer::No => return,
-            sys::Answer::Cancel => {
+        // The notes' first line is their headline ("Slate 1.5.3: what it is").
+        let mut lines = m.notes.lines();
+        let first = lines.next().unwrap_or("").trim();
+        let headline = first.split_once(':').map(|(_, h)| h.trim()).filter(|h| !h.is_empty()).unwrap_or(first);
+        let mut cs = headline.chars();
+        let headline: String = cs.next().map(|c| c.to_uppercase().chain(cs).collect()).unwrap_or_default();
+        let rest: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+        let spec = Spec {
+            mark: Mark::Logo,
+            title: format!("Slate {} is ready to install", m.version),
+            sub: if headline.is_empty() { format!("You have {}.", update::current_version()) } else { format!("{headline} \u{2013} you have {}.", update::current_version()) },
+            body: format!("{rest}{}Slate restarts and reopens all your tabs, unsaved text included.", if rest.is_empty() { "" } else { "\n\n" }),
+            rows: Vec::new(),
+            buttons: vec!["Install and restart".into(), "Later".into(), "Skip this version".into()],
+            primary: 0,
+            cancel: 1,
+            width: 520.0,
+        };
+        match crate::dialog::show(self.hwnd, spec) {
+            0 => {}
+            1 => return,
+            _ => {
                 settings::get_mut().skip_version = m.version.clone();
                 settings::save();
                 self.upd.available = None;

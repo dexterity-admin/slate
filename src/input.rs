@@ -446,8 +446,24 @@ impl App {
                 self.capture();
                 self.redraw();
             }
-            Hit::Menu => self.command_palette(),
+            Hit::Menu => self.app_menu(),
             Hit::People => self.team_people(),
+            Hit::Live(v, true) => {
+                self.av = v;
+                self.after_switch();
+                let bi = self.bi(self.tab(v).buf);
+                let name = self.bufs[bi].name();
+                let remote = self.bufs[bi].collab.as_ref().map_or(false, |c| c.owner.is_some());
+                let (title, body, yes) = if remote {
+                    (format!("Leave {name}?"), "You keep a copy of the text here; the file stays on their PC.".to_string(), "Leave")
+                } else {
+                    (format!("Stop sharing {name}?"), "Others in the session keep their copy of the text. You can share it again any time.".to_string(), "Stop sharing")
+                };
+                if crate::sys::confirm(self.hwnd, &title, &body, yes, "Keep co-editing") {
+                    self.collab_toggle();
+                }
+            }
+            Hit::Live(..) => {}
             Hit::Grid(v) => self.grid_mouse_down(v, x, y, shift),
             Hit::Tab(v, i) => {
                 self.views[v].active = i;
@@ -802,12 +818,12 @@ impl App {
                 self.av = v;
                 self.after_switch();
                 let items = [
-                    (1, "Close", true),
+                    (1, "Close\tCtrl+W", true),
                     (2, "Close Others", true),
                     (3, "Close All", true),
                     (0, "", true),
-                    (4, "Save", true),
-                    (5, "Save As…", true),
+                    (4, "Save\tCtrl+S", true),
+                    (5, "Save As…\tCtrl+Alt+S", true),
                     (0, "", true),
                     (6, "Copy Full Path", self.cur_ref().path.is_some()),
                     (7, "Show in Explorer", self.cur_ref().path.is_some()),
@@ -840,13 +856,13 @@ impl App {
                 let can_undo = b.can_undo();
                 self.redraw();
                 let items = [
-                    (1, "Undo", can_undo),
-                    (2, "Redo", true),
+                    (1, "Undo\tCtrl+Z", can_undo),
+                    (2, "Redo\tCtrl+Y", true),
                     (0, "", true),
-                    (3, "Cut", true),
-                    (4, "Copy", true),
-                    (5, "Paste", true),
-                    (6, "Select All", true),
+                    (3, "Cut\tCtrl+X", true),
+                    (4, "Copy\tCtrl+C", true),
+                    (5, "Paste\tCtrl+V", true),
+                    (6, "Select All\tCtrl+A", true),
                     (0, "", true),
                     (7, "Toggle Comment", true),
                     (8, "UPPERCASE", has_sel),
@@ -855,7 +871,7 @@ impl App {
                     (10, "Toggle Bookmark", true),
                     (11, "Toggle Fold", true),
                     (0, "", true),
-                    (12, "Command Palette…", true),
+                    (12, "Command Palette…\tCtrl+Shift+P", true),
                 ];
                 let cmd = match sys::popup_menu(self.hwnd, pt, &items) {
                     1 => Cmd::Undo,
