@@ -296,6 +296,10 @@ pub enum PalAct {
     Cmd(Cmd),
     Tab(usize, usize),
     Open(String),
+    /// Join co-editing: (peer, session, path as that peer sees it).
+    CoJoin(u64, u64, String),
+    /// Ask a peer to share a file only their PC can open: (peer, path).
+    CoAsk(u64, String),
     Lang(usize),
     Enc(Enc),
     Reopen(Enc),
@@ -521,6 +525,9 @@ pub struct App {
     pub team: Option<crate::team::Team>,
     /// Co-editing sessions already offered, with who was offered.
     pub collab_offered: HashMap<u64, u64>,
+    /// Files on other PCs this Slate asked to co-edit: (peer, path). The
+    /// session is joined as soon as that peer starts it.
+    pub collab_asks: Vec<(u64, String)>,
     /// The window closes once background saves are done.
     pub close_after_save: bool,
     pub ai: crate::ai::AiPanel,
@@ -595,6 +602,7 @@ impl App {
             cmp_sync: None,
             team: None,
             collab_offered: HashMap::new(),
+            collab_asks: Vec::new(),
             close_after_save: false,
             ai: Default::default(),
             splash_since: None,
@@ -855,6 +863,10 @@ impl App {
         if self.bufs[i].saving.is_some() {
             self.flash("Still saving this file\u{2026}");
             return false;
+        }
+        // A co-edited file that lives on another PC: whoever has it saves it.
+        if !save_as && self.bufs[i].path.is_none() && self.collab_save_remote(i) {
+            return true;
         }
         let path = match (&self.bufs[i].path, save_as) {
             (Some(p), false) => p.clone(),
@@ -1909,6 +1921,8 @@ impl App {
             PalAct::Open(path) => {
                 self.open_path(&path);
             }
+            PalAct::CoJoin(peer, sid, path) => self.collab_join_from_list(peer, sid, &path),
+            PalAct::CoAsk(peer, path) => self.collab_ask(peer, path),
             PalAct::Lang(l) => {
                 self.cur().set_lang(l);
             }

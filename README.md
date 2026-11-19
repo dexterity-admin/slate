@@ -165,6 +165,10 @@ change it). **Settings: Toggle Team Features (LAN)** turns it all off.
   ordered history, so when that person leaves or their PC drops off, the others choose a new one,
   catch up and resend whatever was not confirmed – nothing typed is lost. Undo takes back only your
   own changes, wherever the others typed.
+  A file that only your PC can open (on your C: drive, say) can be co-edited too: colleagues pick it
+  under **Team: Who's Online** and the text comes over the network. Their Ctrl+S saves it on your PC;
+  if you close it, they keep their copy. Picking a colleague's local file they have not shared yet
+  asks them to share it, and it opens as soon as they press Ctrl+Shift+E.
 - **Library** – snippets, shared macros and find / replace presets (**Library:** commands insert,
   run, use, save and delete them). Every PC keeps a copy and the copies sync: the newest version of
   each item wins, and deletions travel too.

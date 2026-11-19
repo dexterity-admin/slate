@@ -333,6 +333,7 @@ impl App {
                     Msg::LibWant { items } => self.lib_on_want(from, items),
                     Msg::LibItem { meta, body } => self.lib_on_item(meta, body),
                     Msg::SearchRes { qid, text } => self.search_result(qid, text),
+                    Msg::CoEditAsk { path } => self.collab_on_ask(from, path),
                     Msg::SearchReq { .. } | Msg::Hello { .. } | Msg::Bye => {}
                     m => self.collab_on_msg(from, m),
                 }
@@ -477,16 +478,26 @@ impl App {
             let ver = if p.version != env!("CARGO_PKG_VERSION") { format!(" \u{B7} Slate {}", p.version) } else { String::new() };
             items.push(PalItem { label: p.name.clone(), hint: format!("{} \u{B7} {summary}{ver}", p.pc), act: PalAct::Cmd(crate::app::Cmd::TeamPeople) });
             for f in &p.files {
-                let st = match f.state {
-                    FileState::Open => "",
-                    FileState::Editing => "editing \u{B7} ",
-                    FileState::Locked => "locked \u{B7} ",
+                let session = p.sessions.iter().find(|s| s.path == f.path);
+                let st = match (session.is_some(), f.state) {
+                    (true, _) => "co-editing \u{2013} pick to join \u{B7} ",
+                    (_, FileState::Open) => "",
+                    (_, FileState::Editing) => "editing \u{B7} ",
+                    (_, FileState::Locked) => "locked \u{B7} ",
                 };
                 let name = Path::new(&f.path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let dir = Path::new(&f.path).parent().map(|d| d.display().to_string()).unwrap_or_default();
-                // Another PC's local file cannot be opened from here.
-                let act = if f.path.starts_with("\\\\") || p.pc.eq_ignore_ascii_case(&t.pc) { PalAct::Open(f.path.clone()) } else { PalAct::Cmd(crate::app::Cmd::TeamPeople) };
-                items.push(PalItem { label: format!("      {name}"), hint: format!("{st}{dir}"), act });
+                let reachable = f.path.starts_with("\\\\") || p.pc.eq_ignore_ascii_case(&t.pc);
+                // A shared file joins its session (another PC's local file
+                // comes over the network); else open it, or ask its owner
+                // to share it when only their PC has it.
+                let act = match session {
+                    Some(s) => PalAct::CoJoin(p.id, s.sid, f.path.clone()),
+                    None if reachable => PalAct::Open(f.path.clone()),
+                    None => PalAct::CoAsk(p.id, f.path.clone()),
+                };
+                let hint = if session.is_none() && !reachable { format!("{st}on {}\u{2019}s PC \u{2013} pick to ask to co-edit", p.name) } else { format!("{st}{dir}") };
+                items.push(PalItem { label: format!("      {name}"), hint, act });
             }
         }
         for h in t.hubs() {

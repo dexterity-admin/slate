@@ -13,6 +13,9 @@ param(
     # Separate data folders (library, settings) per window, off C:.
     [string]$DataA = "",
     [string]$DataB = "",
+    # Distinct PC names make each window's local files "another PC's".
+    [string]$PcA = "",
+    [string]$PcB = "",
     [string]$OutDir = "$PSScriptRoot\..\shots",
     [string]$Steps = "shot:duo",
     [int]$Width = 860,
@@ -35,16 +38,19 @@ public class DW {
 "@
 [void][DW]::SetProcessDPIAware()
 New-Item -ItemType Directory -Force $OutDir | Out-Null
-function Start-One([string]$name, [string]$extra, [int]$x, [string]$data) {
+function Start-One([string]$name, [string]$extra, [int]$x, [string]$data, [string]$pc) {
     $env:SLATE_TEAM_NAME = $name
+    $realPc = $env:COMPUTERNAME
+    if ($pc) { $env:COMPUTERNAME = $pc }
     if ($data) { $env:SLATE_DATA_DIR = $data } else { Remove-Item Env:SLATE_DATA_DIR -ErrorAction SilentlyContinue }
     $p = Start-Process -FilePath $Exe -ArgumentList ("-multiInst -nosession " + $extra) -PassThru
+    $env:COMPUTERNAME = $realPc
     for ($i = 0; $i -lt 60 -and $p.MainWindowHandle -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 100; $p.Refresh() }
     [void][DW]::SetWindowPos($p.MainWindowHandle, [IntPtr](-1), $x, 40, $Width, $Height, 0)
     $p
 }
-$pa = Start-One $NameA $ArgsA 0 $DataA
-$pb = Start-One $NameB $ArgsB ($Width + 8) $DataB
+$pa = Start-One $NameA $ArgsA 0 $DataA $PcA
+$pb = Start-One $NameB $ArgsB ($Width + 8) $DataB $PcB
 Remove-Item Env:SLATE_DATA_DIR -ErrorAction SilentlyContinue
 Remove-Item Env:SLATE_TEAM_NAME
 Start-Sleep -Milliseconds 800

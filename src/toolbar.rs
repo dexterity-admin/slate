@@ -136,7 +136,7 @@ impl App {
             Cmd::MacroRecord => (true, self.recording.is_some()),
             Cmd::MacroPlay => (!self.last_macro.is_empty() && self.recording.is_none() && !ro, false),
             Cmd::Follow => (b.path.is_some() && b.diff.is_none(), b.follow.is_some()),
-            Cmd::CoEdit => (self.team.is_some() && b.path.is_some() && b.diff.is_none(), b.collab.is_some()),
+            Cmd::CoEdit => (self.team.is_some() && (b.path.is_some() || b.collab.is_some()) && b.diff.is_none(), b.collab.is_some()),
             Cmd::Ai => (true, self.ai.open),
             _ => (true, false),
         }

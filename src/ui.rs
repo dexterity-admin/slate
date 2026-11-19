@@ -30,10 +30,12 @@ pub fn badge(b: &crate::buffer::Buffer) -> Option<(String, u32)> {
     if b.diff.is_some() {
         return Some(("DIFF".into(), 0xD29922));
     }
-    if b.label.is_some() {
+    if b.label.as_deref() == Some("Search results") {
         return Some(("FIND".into(), 0x8B95A7));
     }
-    let path = b.path.as_ref()?;
+    // A co-edited file on another PC: badge from that PC's path.
+    let remote = b.collab.as_ref().filter(|c| c.owner.is_some()).map(|c| std::path::PathBuf::from(&c.path));
+    let path = b.path.as_ref().or(remote.as_ref())?;
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     let color = match ext.as_str() {
         "pcf" | "pcfx" => 0xF0883E,

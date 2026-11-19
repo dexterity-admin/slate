@@ -57,6 +57,10 @@ pub enum Msg {
     Refuse { sid: u64, reason: String },
     /// Answer to `Elect` from someone who still reaches the host.
     Alive { sid: u64, gen: u64, host: u64 },
+    /// A co-editor without the file asks whoever has it to save it.
+    SaveReq { sid: u64 },
+    /// Someone who cannot open this file asks to co-edit it.
+    CoEditAsk { path: String },
     // Team library.
     LibManifest { items: Vec<LibMeta> },
     LibWant { items: Vec<(u8, String)> },
@@ -253,6 +257,14 @@ impl Msg {
                 w.u64(*gen);
                 w.u64(*host);
             }
+            Msg::SaveReq { sid } => {
+                w.u8(23);
+                w.u64(*sid);
+            }
+            Msg::CoEditAsk { path } => {
+                w.u8(24);
+                w.str(path);
+            }
             Msg::LibManifest { items } => {
                 w.u8(30);
                 w.u32(items.len() as u32);
@@ -312,6 +324,8 @@ impl Msg {
             20 => Msg::ResumeDone { sid: r.u64()?, gen: r.u64()?, rev: r.u64()? },
             21 => Msg::Refuse { sid: r.u64()?, reason: r.str()? },
             22 => Msg::Alive { sid: r.u64()?, gen: r.u64()?, host: r.u64()? },
+            23 => Msg::SaveReq { sid: r.u64()? },
+            24 => Msg::CoEditAsk { path: r.str()? },
             30 => {
                 let n = r.count(26)?;
                 Msg::LibManifest { items: (0..n).map(|_| r.meta()).collect::<Option<Vec<_>>>()? }
@@ -395,6 +409,8 @@ mod tests {
             Msg::ResumeDone { sid: 3, gen: 4, rev: 11 },
             Msg::Refuse { sid: 3, reason: "no".into() },
             Msg::Alive { sid: 3, gen: 4, host: 1 },
+            Msg::SaveReq { sid: 3 },
+            Msg::CoEditAsk { path: r"\\srv\a.txt".into() },
             Msg::LibManifest { items: vec![meta.clone()] },
             Msg::LibWant { items: vec![(1, "Renumber spools".into())] },
             Msg::LibItem { meta, body: b"k 36 1 0 0\n".to_vec() },

@@ -679,6 +679,9 @@ pub struct Collab {
     pub outbox: Vec<(usize, usize, usize, Vec<u8>)>,
     /// Set while a remote change is applied, so it is not sent back.
     pub muted: bool,
+    /// For a file only another PC can open: the peer that has it. Saving
+    /// goes to them, and the session ends here when they leave it.
+    pub owner: Option<u64>,
 }
 
 impl Collab {
@@ -709,8 +712,14 @@ impl App {
     /// The session others run on a file: (sid, gen, host, names in it).
     fn session_for(&self, bi: usize) -> Option<(u64, u64, u64, Vec<String>)> {
         let t = self.team.as_ref()?;
-        let key = t.key_of(self.bufs[bi].path.as_ref()?);
-        let sid = session_id(&key);
+        let sid = session_id(&t.key_of(self.bufs[bi].path.as_ref()?));
+        let (gen, host, names) = self.session_by_sid(sid)?;
+        Some((sid, gen, host, names))
+    }
+
+    /// Session `sid` as the others publish it: (gen, host, names in it).
+    fn session_by_sid(&self, sid: u64) -> Option<(u64, u64, Vec<String>)> {
+        let t = self.team.as_ref()?;
         // Several lineages can exist for a moment; the lowest gen wins.
         let mut best: Option<(u64, u64)> = None;
         let mut names = Vec::new();
@@ -724,7 +733,130 @@ impl App {
                 }
             }
         }
-        best.map(|(g, h)| (sid, g, h, names))
+        best.map(|(g, h)| (g, h, names))
+    }
+
+    fn peer_name(&self, id: u64) -> String {
+        self.team.as_ref().and_then(|t| t.peers.get(&id)).map(|p| p.name.clone()).unwrap_or_else(|| "The other person".into())
+    }
+
+    fn show_buf(&mut self, bi: usize) {
+        if let Some((v, i)) = self.find_open_id(self.bufs[bi].id) {
+            self.views[v].active = i;
+            self.av = v;
+            self.after_switch();
+        }
+    }
+
+    /// A co-editing session picked from the people list: opens the file and
+    /// joins when this PC can open it, else joins with the shared text only.
+    pub fn collab_join_from_list(&mut self, peer: u64, sid: u64, path: &str) {
+        if let Some(bi) = self.collab_bi(sid) {
+            return self.show_buf(bi);
+        }
+        let Some(t) = &self.team else { return };
+        let reachable = path.starts_with("\\\\") || t.peers.get(&peer).map_or(false, |p| p.pc.eq_ignore_ascii_case(&t.pc));
+        if !reachable {
+            return self.collab_join_remote(peer, sid, path.to_string());
+        }
+        if !self.open_path(path) {
+            return;
+        }
+        let bi = self.bi(self.tab(self.av).buf);
+        if self.bufs[bi].collab.is_none() && self.bufs[bi].loading.is_none() {
+            self.collab_toggle();
+        }
+    }
+
+    /// Joins a session on a file only another PC can open: the text comes
+    /// from the session, and saving goes to `owner`, who has the file.
+    fn collab_join_remote(&mut self, owner: u64, sid: u64, path: String) {
+        let Some((_, host, _)) = self.session_by_sid(sid) else {
+            return self.flash("That co-editing session has ended");
+        };
+        let Some(t) = &self.team else { return };
+        if !t.net.connected(host) {
+            return self.flash("The person hosting this session is not reachable right now");
+        }
+        let me = t.me;
+        let who = self.peer_name(owner);
+        let file = std::path::Path::new(&path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+        let id = self.new_buffer(Vec::new());
+        let bi = self.bi(id);
+        let lang = crate::syntax::lang_for_path(&path);
+        self.bufs[bi].set_lang(lang);
+        self.bufs[bi].label = Some(format!("{file} ({who})"));
+        let (core, outs) = Core::join(me, sid, host);
+        self.bufs[bi].collab = Some(Box::new(Collab { core, path, outbox: Vec::new(), muted: false, owner: Some(owner) }));
+        self.add_tab(self.av, id);
+        self.collab_run(bi, outs);
+        self.flash(&format!("Joining {who}\u{2019}s {file}\u{2026}"));
+        self.collab_timer();
+        self.after_switch();
+    }
+
+    /// Asks `peer` to share a file only their PC can open; the session is
+    /// joined here as soon as they start it.
+    pub fn collab_ask(&mut self, peer: u64, path: String) {
+        let Some(t) = &self.team else { return };
+        let Some(p) = t.peers.get(&peer) else {
+            return self.flash("They are no longer online");
+        };
+        if let Some(sid) = p.sessions.iter().find(|s| s.path == path).map(|s| s.sid) {
+            return self.collab_join_from_list(peer, sid, &path);
+        }
+        let name = p.name.clone();
+        t.net.send(peer, &Msg::CoEditAsk { path: path.clone() });
+        let file = std::path::Path::new(&path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if !self.collab_asks.contains(&(peer, path.clone())) {
+            self.collab_asks.push((peer, path));
+        }
+        self.flash(&format!("{file} is on {name}\u{2019}s PC \u{2013} asked {name} to share it; it opens here when they turn co-editing on"));
+    }
+
+    /// Someone asked to co-edit one of this Slate's files.
+    pub fn collab_on_ask(&mut self, from: u64, path: String) {
+        let Some(t) = &self.team else { return };
+        let Some(bi) = self.bufs.iter().position(|b| b.path.as_ref().map_or(false, |p| t.shared(p).eq_ignore_ascii_case(&path))) else { return };
+        if self.bufs[bi].collab.is_some() {
+            return;
+        }
+        let (who, file) = (self.peer_name(from), self.bufs[bi].name());
+        self.flash(&format!("{who} asks to co-edit {file} with you \u{2013} on that tab, Ctrl+Shift+E (or the People button) starts co-editing"));
+    }
+
+    /// Ctrl+S on a file another PC has: asks that PC to save it. False
+    /// when it cannot, so the caller saves a copy here instead.
+    pub fn collab_save_remote(&mut self, bi: usize) -> bool {
+        let Some(c) = self.bufs[bi].collab.as_ref() else { return false };
+        let Some(owner) = c.owner else { return false };
+        let (sid, live) = (c.core.sid, c.core.phase == Phase::Live && c.core.members.contains(&owner));
+        let who = self.peer_name(owner);
+        if !live || !self.team.as_ref().map_or(false, |t| t.net.connected(owner)) {
+            self.flash(&format!("{who} cannot be reached to save the file \u{2013} choose where to save a copy"));
+            return false;
+        }
+        // Our latest edits travel ahead of the request.
+        self.collab_flush();
+        if let Some(t) = &self.team {
+            t.net.send(owner, &Msg::SaveReq { sid });
+        }
+        self.flash(&format!("Asked {who} to save it on their PC"));
+        true
+    }
+
+    /// Ends a session on another PC's file once that PC has left it: edits
+    /// could no longer reach the file.
+    fn collab_check_owner(&mut self, bi: usize) {
+        let Some(c) = self.bufs[bi].collab.as_ref() else { return };
+        let Some(owner) = c.owner else { return };
+        if c.core.phase != Phase::Live || c.core.members.contains(&owner) {
+            return;
+        }
+        let who = self.peer_name(owner);
+        self.collab_leave(bi);
+        self.flash(&format!("{who} stopped sharing this file \u{2013} your copy is kept; Ctrl+S saves it on this PC"));
+        self.team_publish();
     }
 
     /// "Ravi is" / "Ravi and Anil are" when others co-edit this file.
@@ -749,8 +881,12 @@ impl App {
             return self.flash("Team features are off \u{2013} Settings: Toggle Team Features");
         };
         let b = &self.bufs[bi];
+        if b.path.is_none() && b.diff.is_none() && t.people().iter().any(|p| !p.sessions.is_empty()) {
+            // Someone shares a file: let them pick it.
+            return self.team_people();
+        }
         if b.path.is_none() || b.diff.is_some() || b.loading.is_some() {
-            return self.flash("Co-editing works on saved files");
+            return self.flash("Co-editing works on saved files \u{2013} save this one first");
         }
         if let Some(by) = b.locked_by.clone() {
             return self.flash(&format!("{by} has locked this file"));
@@ -766,7 +902,7 @@ impl App {
                     return;
                 }
                 let (core, outs) = Core::join(me, sid, host);
-                self.bufs[bi].collab = Some(Box::new(Collab { core, path, outbox: Vec::new(), muted: false }));
+                self.bufs[bi].collab = Some(Box::new(Collab { core, path, outbox: Vec::new(), muted: false, owner: None }));
                 self.bufs[bi].lock_since = None;
                 self.collab_run(bi, outs);
                 let n: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
@@ -776,7 +912,7 @@ impl App {
             None => {
                 let sid = session_id(&t.key_of(b.path.as_ref().unwrap()));
                 let gen = crate::net::new_id();
-                self.bufs[bi].collab = Some(Box::new(Collab { core: Core::host(me, sid, gen), path, outbox: Vec::new(), muted: false }));
+                self.bufs[bi].collab = Some(Box::new(Collab { core: Core::host(me, sid, gen), path, outbox: Vec::new(), muted: false, owner: None }));
                 self.bufs[bi].lock_since = None;
                 self.flash("Co-editing on: others who open this file can join with Ctrl+Shift+E");
             }
@@ -789,6 +925,10 @@ impl App {
     /// Leaves the session of buffer `bi` (also when its tab closes).
     pub fn collab_leave(&mut self, bi: usize) {
         if let Some(mut c) = self.bufs[bi].collab.take() {
+            if self.bufs[bi].path.is_none() {
+                // Text of another PC's file: unsaved here.
+                self.bufs[bi].mark_unsaved();
+            }
             let outs = c.core.leave();
             if let Some(t) = &self.team {
                 for o in outs {
@@ -836,7 +976,9 @@ impl App {
                 }
                 Out::Note(s) => self.flash(&s),
                 Out::Stop(s) => {
-                    self.bufs[bi].collab = None;
+                    if self.bufs[bi].collab.take().map_or(false, |c| c.owner.is_some()) && self.bufs[bi].path.is_none() {
+                        self.bufs[bi].mark_unsaved();
+                    }
                     self.flash(&format!("{s} \u{2013} co-editing stopped; your text is kept"));
                     self.team_publish();
                 }
@@ -847,7 +989,8 @@ impl App {
     /// Puts the shared text into the buffer.
     fn collab_install(&mut self, bi: usize, text: Vec<u8>) {
         let on_disk = self.bufs[bi].path.as_ref().and_then(|p| crate::doc::read_for_doc(p).ok()).map(|raw| crate::enc::decode(raw, None).text);
-        let same = on_disk.as_deref() == Some(&text[..]);
+        let remote = self.bufs[bi].path.is_none() && self.bufs[bi].collab.as_ref().map_or(false, |c| c.owner.is_some());
+        let same = remote || on_disk.as_deref() == Some(&text[..]);
         let b = &mut self.bufs[bi];
         let line = b.doc.line_of(b.caret());
         if let Some(c) = b.collab.as_mut() {
@@ -878,7 +1021,7 @@ impl App {
 
     pub fn collab_on_msg(&mut self, from: u64, m: Msg) {
         let sid = match &m {
-            Msg::Join { sid } | Msg::Snapshot { sid, .. } | Msg::Op { sid, .. } | Msg::Seq { sid, .. } | Msg::Members { sid, .. } | Msg::Cursor { sid, .. } | Msg::Saved { sid, .. } | Msg::Leave { sid } | Msg::Elect { sid, .. } | Msg::Resume { sid, .. } | Msg::ResumeDone { sid, .. } | Msg::Refuse { sid, .. } => *sid,
+            Msg::Join { sid } | Msg::Snapshot { sid, .. } | Msg::Op { sid, .. } | Msg::Seq { sid, .. } | Msg::Members { sid, .. } | Msg::Cursor { sid, .. } | Msg::Saved { sid, .. } | Msg::Leave { sid } | Msg::Elect { sid, .. } | Msg::Resume { sid, .. } | Msg::ResumeDone { sid, .. } | Msg::Refuse { sid, .. } | Msg::SaveReq { sid } => *sid,
             _ => return,
         };
         // Local edits go first, so the order stays right.
@@ -891,6 +1034,18 @@ impl App {
             }
             return;
         };
+        if let Msg::SaveReq { .. } = m {
+            // Only the PC that has the file saves it.
+            let b = &self.bufs[bi];
+            if b.path.is_some() && b.saving.is_none() {
+                let (id, who) = (b.id, self.peer_name(from));
+                if self.save_buf(id, false) {
+                    let name = self.bufs[self.bi(id)].name();
+                    self.flash(&format!("Saved {name} \u{2013} {who} asked"));
+                }
+            }
+            return;
+        }
         let outs = self.bufs[bi].collab.as_mut().unwrap().core.on_msg(from, m);
         let applied = outs.iter().any(|o| matches!(o, Out::Apply(_)));
         self.collab_run(bi, outs);
@@ -898,6 +1053,7 @@ impl App {
             self.edited();
             self.recount_if_open();
         }
+        self.collab_check_owner(bi);
         self.collab_timer();
         self.team_publish();
         self.update_title();
@@ -911,7 +1067,9 @@ impl App {
             }
             let outs = c.core.member_gone(id, true);
             self.collab_run(bi, outs);
+            self.collab_check_owner(bi);
         }
+        self.collab_asks.retain(|a| a.0 != id);
         self.collab_timer();
         self.team_publish();
     }
@@ -931,6 +1089,7 @@ impl App {
             let was = c.core.phase;
             let outs = c.core.tick();
             self.collab_run(bi, outs);
+            self.collab_check_owner(bi);
             let now = self.bufs[bi].collab.as_ref().map(|c| c.core.phase);
             if was != Phase::Live && now == Some(Phase::Live) {
                 let host_is_me = self.bufs[bi].collab.as_ref().map_or(false, |c| c.core.host == c.core.me);
@@ -991,6 +1150,15 @@ impl App {
 
     pub fn collab_saved(&mut self, id: u32) {
         let bi = self.bi(id);
+        if self.bufs[bi].collab.as_ref().map_or(false, |c| c.owner.is_some()) {
+            // Saved as a copy on this PC: no longer the other PC's file.
+            let who = self.bufs[bi].collab.as_ref().and_then(|c| c.owner).map(|o| self.peer_name(o)).unwrap_or_default();
+            self.collab_leave(bi);
+            self.bufs[bi].mark_saved();
+            self.bufs[bi].label = None;
+            self.team_publish();
+            return self.flash(&format!("Saved a copy on this PC \u{2013} co-editing {who}\u{2019}s file stopped"));
+        }
         let Some(c) = self.bufs[bi].collab.as_mut() else { return };
         let outs = c.core.saved();
         self.collab_run(bi, outs);
@@ -999,6 +1167,14 @@ impl App {
     /// Reacts to someone's new presence: offers to join a session on an
     /// open file once, and merges two sessions started at the same moment.
     pub fn collab_on_presence(&mut self, from: u64) {
+        let asked: Vec<(u64, String)> = self.collab_asks.iter().filter(|a| a.0 == from).cloned().collect();
+        for (peer, path) in asked {
+            let sid = self.team.as_ref().and_then(|t| t.peers.get(&peer)).and_then(|p| p.sessions.iter().find(|s| s.path == path).map(|s| s.sid));
+            if let Some(sid) = sid {
+                self.collab_asks.retain(|a| *a != (peer, path.clone()));
+                self.collab_join_from_list(peer, sid, &path);
+            }
+        }
         let mut offers = Vec::new();
         for bi in 0..self.bufs.len() {
             if self.bufs[bi].path.is_none() {
@@ -1021,7 +1197,7 @@ impl App {
                     self.collab_leave(bi);
                     let path = self.team.as_ref().map(|t| t.shared(self.bufs[bi].path.as_ref().unwrap())).unwrap_or_default();
                     let (core, outs) = Core::join(me, sid, host);
-                    self.bufs[bi].collab = Some(Box::new(Collab { core, path, outbox: Vec::new(), muted: false }));
+                    self.bufs[bi].collab = Some(Box::new(Collab { core, path, outbox: Vec::new(), muted: false, owner: None }));
                     self.collab_run(bi, outs);
                     self.flash("Someone started co-editing this file at the same moment \u{2013} joining their session");
                 }
